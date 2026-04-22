@@ -1,15 +1,23 @@
 # -*- coding: utf-8 -*-
+import asyncio
+import html
 import io
+import logging
 import os
 import secrets
-import logging
+import socket
 import tempfile
-from datetime import datetime, timezone
+import uuid
+from contextlib import suppress
+from datetime import datetime, timedelta, timezone
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 from telegram import (
     Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup,
     BotCommand, BotCommandScopeDefault, InputFile
 )
+from telegram.error import Conflict
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
@@ -31,6 +39,17 @@ POST_CHANNEL_ID = int(os.environ.get("POST_CHANNEL_ID", 0))  # channel where bot
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "https://vidplays.in/")
 FORCE_JOIN_CHANNEL = "link69_viral"  # without @
 HOW_TO_OPEN_LINK = "https://t.me/c/2047194577/41"  # Instructions for opening links
+INSTANCE_LOCK_ID = "admin_bot_polling_lock"
+INSTANCE_ID = os.environ.get("INSTANCE_ID") or f"{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
+try:
+    SCHEDULE_POLL_SECONDS = max(5, int(os.environ.get("SCHEDULE_POLL_SECONDS", "15")))
+except ValueError:
+    SCHEDULE_POLL_SECONDS = 15
+DISPLAY_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
+try:
+    INSTANCE_LOCK_TTL_SECONDS = max(60, int(os.environ.get("INSTANCE_LOCK_TTL_SECONDS", "180")))
+except ValueError:
+    INSTANCE_LOCK_TTL_SECONDS = 180
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,6 +62,8 @@ db = client['tg_bot_pro_db']
 files_col = db['files']
 users_col = db['users']
 logs_col = db['downloads']
+runtime_col = db['runtime']
+scheduled_posts_col = db['scheduled_posts']
 
 # ━━━ PRELOADED CAPTIONS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CAPTIONS = [
@@ -73,6 +94,17 @@ CAPTIONS = [
 # This dict holds the pending post info until flow completes.
 _pending_post = {}  # user_id -> {token, name, duration, thumb, caption, preview_msg_id}
 
+SCHEDULE_OPTIONS = (
+    ("10m", 10 * 60),
+    ("30m", 30 * 60),
+    ("2h", 2 * 60 * 60),
+    ("6h", 6 * 60 * 60),
+    ("12h", 12 * 60 * 60),
+    ("24h", 24 * 60 * 60),
+)
+SCHEDULE_LABELS = {seconds: label for label, seconds in SCHEDULE_OPTIONS}
+SCHEDULE_LIST_LIMIT = 10
+
 CENSOR_STYLE = os.environ.get("CENSOR_STYLE", "blur").strip().lower()
 try:
     CENSOR_THRESHOLD = float(os.environ.get("CENSOR_THRESHOLD", "0.15"))
@@ -98,6 +130,71 @@ LABEL_OVAL_SIZE = {
 }
 
 _nude_detector = None
+
+
+def _lock_document(now: datetime) -> dict:
+    return {
+        "_id": INSTANCE_LOCK_ID,
+        "instance_id": INSTANCE_ID,
+        "host": socket.gethostname(),
+        "updated_at": now,
+        "expires_at": now + timedelta(seconds=INSTANCE_LOCK_TTL_SECONDS),
+    }
+
+
+async def acquire_instance_lock() -> bool:
+    now = datetime.now(timezone.utc)
+    document = _lock_document(now)
+
+    current = await runtime_col.find_one({"_id": INSTANCE_LOCK_ID})
+    if current:
+        expires_at = current.get("expires_at")
+        if (
+            current.get("instance_id") != INSTANCE_ID
+            and isinstance(expires_at, datetime)
+            and expires_at > now
+        ):
+            logging.error(
+                "Another bot instance is already active on %s until %s (instance=%s).",
+                current.get("host", "unknown-host"),
+                expires_at.isoformat(),
+                current.get("instance_id", "unknown"),
+            )
+            return False
+
+        await runtime_col.replace_one({"_id": INSTANCE_LOCK_ID}, document, upsert=True)
+        return True
+
+    try:
+        await runtime_col.insert_one(document)
+        return True
+    except DuplicateKeyError:
+        logging.error("Could not acquire the bot instance lock because another worker created it first.")
+        return False
+
+
+async def renew_instance_lock() -> bool:
+    now = datetime.now(timezone.utc)
+    result = await runtime_col.update_one(
+        {"_id": INSTANCE_LOCK_ID, "instance_id": INSTANCE_ID},
+        {"$set": _lock_document(now)},
+    )
+    return result.modified_count == 1
+
+
+async def release_instance_lock() -> None:
+    await runtime_col.delete_one({"_id": INSTANCE_LOCK_ID, "instance_id": INSTANCE_ID})
+
+
+async def keep_instance_lock_alive(application) -> None:
+    interval_seconds = max(30, INSTANCE_LOCK_TTL_SECONDS // 3)
+    while True:
+        await asyncio.sleep(interval_seconds)
+        renewed = await renew_instance_lock()
+        if not renewed:
+            logging.error("Lost the single-instance lock; stopping the bot to avoid duplicate polling.")
+            await application.stop()
+            return
 
 
 # ━━━ HELPERS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -141,6 +238,290 @@ def get_channel_kb(link: str):
         [InlineKeyboardButton("▶️ Watch Now", url=link)],
         [InlineKeyboardButton("📖 How to Open Link", url=HOW_TO_OPEN_LINK)],
     ])
+
+
+def admin_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Statistics", callback_data="stats")],
+        [InlineKeyboardButton("System Status", callback_data="status")],
+        [InlineKeyboardButton("Scheduled Posts", callback_data="sched_list")],
+        [InlineKeyboardButton("Refresh", callback_data="refresh")],
+    ])
+
+
+def preview_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Send Now", callback_data="pc_send"),
+         InlineKeyboardButton("New Caption", callback_data="pc_rot")],
+        [InlineKeyboardButton("10m", callback_data="pc_delay_600"),
+         InlineKeyboardButton("30m", callback_data="pc_delay_1800"),
+         InlineKeyboardButton("2h", callback_data="pc_delay_7200")],
+        [InlineKeyboardButton("6h", callback_data="pc_delay_21600"),
+         InlineKeyboardButton("12h", callback_data="pc_delay_43200"),
+         InlineKeyboardButton("24h", callback_data="pc_delay_86400")],
+        [InlineKeyboardButton("New Thumb", callback_data="pc_rethumb"),
+         InlineKeyboardButton("Cancel", callback_data="pc_cancel")],
+    ])
+
+
+def scheduled_list_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Refresh", callback_data="sched_refresh"),
+         InlineKeyboardButton("Back", callback_data="sched_back")],
+    ])
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def format_schedule_time(value: datetime | None) -> str:
+    if not isinstance(value, datetime):
+        return "N/A"
+    return value.astimezone(DISPLAY_TIMEZONE).strftime("%d %b %I:%M %p IST")
+
+
+def get_post_link(post_data: dict) -> str:
+    return post_data.get("link") or f"{GATEWAY_URL}?token={post_data['token']}"
+
+
+def build_post_caption(post_data: dict) -> str:
+    return f"{post_data['caption']}\n\nâ± Duration: {post_data['duration']}"
+
+
+def get_post_media(post_data: dict):
+    if post_data.get("thumbnail_file_id"):
+        return post_data["thumbnail_file_id"]
+    if post_data.get("thumb"):
+        return post_data["thumb"]
+    if post_data.get("thumb_bytes"):
+        return build_thumb_inputfile(post_data["thumb_bytes"])
+    return None
+
+
+async def send_public_post(bot: Bot, post_data: dict):
+    link = get_post_link(post_data)
+    caption = build_post_caption(post_data)
+    target_chat_id = POST_CHANNEL_ID or ADMIN_USER_ID
+    media = get_post_media(post_data)
+
+    if media:
+        sent_message = await bot.send_photo(
+            chat_id=target_chat_id,
+            photo=media,
+            caption=caption,
+            parse_mode="HTML",
+            reply_markup=get_channel_kb(link),
+        )
+    else:
+        text = caption if POST_CHANNEL_ID else f"ðŸ“ <b>Post:</b>\n\n{caption}"
+        sent_message = await bot.send_message(
+            chat_id=target_chat_id,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=get_channel_kb(link),
+        )
+
+    return sent_message, target_chat_id
+
+
+async def create_scheduled_post(pending: dict, delay_seconds: int) -> datetime:
+    now = utc_now()
+    scheduled_for = now + timedelta(seconds=delay_seconds)
+    await scheduled_posts_col.insert_one({
+        "token": pending["token"],
+        "file_name": pending["name"],
+        "caption": pending["caption"],
+        "duration": pending["duration"],
+        "thumbnail_file_id": pending.get("thumb"),
+        "link": get_post_link(pending),
+        "status": "scheduled",
+        "delay_seconds": delay_seconds,
+        "delay_label": SCHEDULE_LABELS.get(delay_seconds, f"{delay_seconds}s"),
+        "scheduled_for": scheduled_for,
+        "created_at": now,
+        "updated_at": now,
+        "sent_at": None,
+        "failed_at": None,
+        "last_error": None,
+        "target_chat_id": POST_CHANNEL_ID or ADMIN_USER_ID,
+        "target_message_id": None,
+    })
+    return scheduled_for
+
+
+async def claim_due_scheduled_post() -> dict | None:
+    now = utc_now()
+    return await scheduled_posts_col.find_one_and_update(
+        {
+            "status": "scheduled",
+            "scheduled_for": {"$lte": now},
+        },
+        {
+            "$set": {
+                "status": "posting",
+                "updated_at": now,
+                "posting_started_at": now,
+            }
+        },
+        sort=[("scheduled_for", 1), ("created_at", 1)],
+        return_document=ReturnDocument.BEFORE,
+    )
+
+
+async def mark_scheduled_post_sent(post_id, sent_message_id: int | None, target_chat_id: int) -> None:
+    now = utc_now()
+    await scheduled_posts_col.update_one(
+        {"_id": post_id},
+        {
+            "$set": {
+                "status": "sent",
+                "sent_at": now,
+                "updated_at": now,
+                "target_message_id": sent_message_id,
+                "target_chat_id": target_chat_id,
+                "last_error": None,
+            }
+        },
+    )
+
+
+async def mark_scheduled_post_failed(post_id, error_message: str) -> None:
+    now = utc_now()
+    await scheduled_posts_col.update_one(
+        {"_id": post_id},
+        {
+            "$set": {
+                "status": "failed",
+                "failed_at": now,
+                "updated_at": now,
+                "last_error": error_message,
+            }
+        },
+    )
+
+
+async def publish_due_scheduled_posts(bot: Bot) -> None:
+    while True:
+        scheduled_post = await claim_due_scheduled_post()
+        if not scheduled_post:
+            return
+
+        try:
+            sent_message, target_chat_id = await send_public_post(bot, scheduled_post)
+            await mark_scheduled_post_sent(
+                scheduled_post["_id"],
+                getattr(sent_message, "message_id", None),
+                target_chat_id,
+            )
+            logging.info(
+                "Scheduled post sent for token %s at %s",
+                scheduled_post.get("token"),
+                format_schedule_time(scheduled_post.get("scheduled_for")),
+            )
+        except Exception as exc:
+            error_message = str(exc)
+            await mark_scheduled_post_failed(scheduled_post["_id"], error_message)
+            logging.exception("Scheduled post failed for token %s", scheduled_post.get("token"))
+            with suppress(Exception):
+                await bot.send_message(
+                    chat_id=ADMIN_USER_ID,
+                    text=(
+                        "âŒ <b>Scheduled post failed.</b>\n\n"
+                        f"ðŸ“ <code>{html.escape(scheduled_post.get('file_name', 'Post'))}</code>\n"
+                        f"â° <code>{format_schedule_time(scheduled_post.get('scheduled_for'))}</code>\n"
+                        f"ðŸª² <code>{html.escape(error_message)}</code>"
+                    ),
+                    parse_mode="HTML",
+                )
+
+
+async def scheduled_post_poller(application) -> None:
+    while True:
+        try:
+            await publish_due_scheduled_posts(application.bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("Scheduled post poller crashed during a cycle")
+        await asyncio.sleep(SCHEDULE_POLL_SECONDS)
+
+
+async def ensure_runtime_indexes() -> None:
+    await scheduled_posts_col.create_index("token", unique=True, name="scheduled_token_unique_idx")
+    await scheduled_posts_col.create_index(
+        [("status", 1), ("scheduled_for", 1)],
+        name="scheduled_status_due_idx",
+    )
+
+
+async def build_admin_home_text() -> str:
+    pending_count = await scheduled_posts_col.count_documents({"status": "scheduled"})
+    failed_count = await scheduled_posts_col.count_documents({"status": "failed"})
+    next_post = await scheduled_posts_col.find_one(
+        {"status": "scheduled"},
+        sort=[("scheduled_for", 1)],
+    )
+
+    lines = [
+        "<b>JSTAR PRO ADMIN PANEL</b>",
+        "",
+        f"Pending scheduled posts: <code>{pending_count}</code>",
+        f"Failed scheduled posts: <code>{failed_count}</code>",
+    ]
+
+    if next_post:
+        lines.extend([
+            f"Next scheduled post: <code>{format_schedule_time(next_post['scheduled_for'])}</code>",
+            f"Next file: <code>{html.escape(next_post.get('file_name', 'Post'))}</code>",
+        ])
+    else:
+        lines.append("Next scheduled post: <code>None</code>")
+
+    lines.extend([
+        "",
+        "Upload a file to storage to start a new post.",
+    ])
+    return "\n".join(lines)
+
+
+async def build_scheduled_posts_text(limit: int = SCHEDULE_LIST_LIMIT) -> str:
+    pending_count = await scheduled_posts_col.count_documents({"status": "scheduled"})
+    sent_count = await scheduled_posts_col.count_documents({"status": "sent"})
+    failed_count = await scheduled_posts_col.count_documents({"status": "failed"})
+    posts = await scheduled_posts_col.find(
+        {"status": "scheduled"},
+        sort=[("scheduled_for", 1)],
+    ).to_list(length=limit)
+
+    lines = [
+        "<b>Scheduled Posts</b>",
+        "",
+        f"Pending: <code>{pending_count}</code>",
+        f"Sent: <code>{sent_count}</code>",
+        f"Failed: <code>{failed_count}</code>",
+        "",
+    ]
+
+    if not posts:
+        lines.append("No pending scheduled posts.")
+        return "\n".join(lines)
+
+    for index, post in enumerate(posts, start=1):
+        file_name = html.escape(post.get("file_name", "Post"))[:40]
+        delay_label = html.escape(post.get("delay_label", "saved"))
+        lines.append(
+            f"{index}. <code>{file_name}</code>\n"
+            f"   {format_schedule_time(post.get('scheduled_for'))} | {delay_label}"
+        )
+
+    if pending_count > limit:
+        lines.extend([
+            "",
+            f"Showing first <code>{limit}</code> pending posts.",
+        ])
+
+    return "\n".join(lines)
 
 
 def get_nude_detector():
@@ -369,7 +750,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await users_col.update_one(
         {"user_id": user.id},
-        {"$set": {"last_seen": datetime.now(timezone.utc), "name": user.full_name}},
+        {"$set": {"last_seen": utc_now(), "name": user.full_name}},
         upsert=True,
     )
 
@@ -410,9 +791,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Normal /start (no token) ──
     if user.id == ADMIN_USER_ID:
         await update.message.reply_text(
-            "💎 <b>JSTAR PRO ADMIN PANEL</b>\n\n"
-            "📊 Use buttons below or just upload\n"
-            "a file to storage to auto-post.",
+            await build_admin_home_text(),
             reply_markup=admin_kb(),
             parse_mode="HTML",
         )
@@ -473,7 +852,7 @@ async def deliver_file(update: Update, context: ContextTypes.DEFAULT_TYPE, file_
             "token": token,
             "user_id": user_id,  # Track user for analytics
             "is_admin": user_id == ADMIN_USER_ID,  # Mark admin downloads
-            "time": datetime.now(timezone.utc)
+            "time": utc_now()
         })
 
         # Warning + auto-delete after 10 min (send directly to user, not reply)
@@ -483,11 +862,17 @@ async def deliver_file(update: Update, context: ContextTypes.DEFAULT_TYPE, file_
                  "This file will be deleted in <b>10 minutes</b>.",
             parse_mode="HTML",
         )
-        context.job_queue.run_once(
-            auto_delete, 600,
-            [user_id, file_msg.message_id, warn_msg.message_id],
-            chat_id=user_id,
-        )
+        if context.job_queue:
+            context.job_queue.run_once(
+                auto_delete, 600,
+                [user_id, file_msg.message_id, warn_msg.message_id],
+                chat_id=user_id,
+            )
+        else:
+            logging.warning(
+                "Job queue is unavailable; auto-delete was skipped for user %s",
+                user_id,
+            )
 
     except Exception as e:
         await context.bot.send_message(
@@ -654,7 +1039,7 @@ async def on_storage_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "token": token,
         "storage_msg_id": post.message_id,
         "video_duration": video_duration,
-        "created_at": datetime.now(timezone.utc),
+        "created_at": utc_now(),
         "total_downloads": 0,
     })
 
@@ -683,6 +1068,7 @@ async def on_storage_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'token': token,
         'name': file_name,
         'duration': format_duration(video_duration),
+        'link': link,
     }
 
 
@@ -869,8 +1255,258 @@ async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ━━━ MAIN ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+async def safe_query_edit(query, text: str, reply_markup) -> None:
+    try:
+        await query.edit_message_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        if "message is not modified" not in str(exc).lower():
+            raise
+
+
+async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    del context
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "stats":
+        today_start = utc_now().replace(hour=0, minute=0, second=0, microsecond=0)
+        total_links = await files_col.count_documents({})
+        total_users = await users_col.count_documents({})
+        new_users_today = await users_col.count_documents({
+            "last_seen": {"$gte": today_start}
+        })
+
+        agg_all = await logs_col.aggregate(
+            [{"$group": {"_id": None, "dl": {"$sum": 1}}}]
+        ).to_list(1)
+        total_dl_all = agg_all[0]['dl'] if agg_all else 0
+
+        agg_users = await logs_col.aggregate([
+            {"$match": {"is_admin": {"$ne": True}}},
+            {"$group": {"_id": None, "dl": {"$sum": 1}}}
+        ]).to_list(1)
+        total_dl_users = agg_users[0]['dl'] if agg_users else 0
+
+        today_dl = await logs_col.count_documents({
+            "time": {"$gte": today_start},
+            "is_admin": {"$ne": True}
+        })
+
+        await safe_query_edit(
+            query,
+            f"📊 <b>DETAILED ANALYTICS</b>\n\n"
+            f"👥 Total Users: <code>{total_users}</code>\n"
+            f"👥 New Today: <code>{new_users_today}</code>\n"
+            f"🔗 Total Links: <code>{total_links}</code>\n"
+            f"📥 Downloads (Users): <code>{total_dl_users}</code>\n"
+            f"📥 Downloads (All incl. Admin): <code>{total_dl_all}</code>\n"
+            f"📅 Downloads Today: <code>{today_dl}</code>",
+            admin_kb(),
+        )
+        return
+
+    if query.data == "status":
+        try:
+            await client.admin.command('ping')
+            db_st = "Connected"
+        except Exception:
+            db_st = "Disconnected"
+
+        scheduled_count = await scheduled_posts_col.count_documents({"status": "scheduled"})
+        await safe_query_edit(
+            query,
+            f"<b>SYSTEM STATUS</b>\n\n"
+            f"MongoDB: <code>{db_st}</code>\n"
+            f"Bot: <code>Running</code>\n"
+            f"Scheduled Pending: <code>{scheduled_count}</code>",
+            admin_kb(),
+        )
+        return
+
+    if query.data in {"sched_list", "sched_refresh"}:
+        await safe_query_edit(
+            query,
+            await build_scheduled_posts_text(),
+            scheduled_list_kb(),
+        )
+        return
+
+    if query.data in {"sched_back", "refresh"}:
+        await safe_query_edit(
+            query,
+            await build_admin_home_text(),
+            admin_kb(),
+        )
+
+
+async def skip_thumb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_USER_ID:
+        return
+
+    pending = _pending_post.get(user_id)
+    if not pending:
+        await update.message.reply_text("❌ No pending post to skip.")
+        return
+
+    pending['caption'] = secrets.choice(CAPTIONS)
+
+    try:
+        await send_public_post(context.bot, pending)
+        if POST_CHANNEL_ID:
+            await update.message.reply_text(
+                "✅ <b>Posted to channel!</b>",
+                parse_mode="HTML",
+            )
+        else:
+            await update.message.reply_text(
+                "✅ <b>Done!</b> POST_CHANNEL_ID not set - sent to you.\nSet it in Railway to auto-post.",
+                parse_mode="HTML",
+            )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Failed to post: {e}\nCheck POST_CHANNEL_ID and bot admin rights.",
+            parse_mode="HTML",
+        )
+
+    _pending_post.pop(user_id, None)
+
+
+async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    user_id = update.effective_user.id
+
+    pending = _pending_post.get(user_id)
+    if not pending:
+        await q.answer("Session expired.", show_alert=True)
+        return
+
+    if q.data == "pc_send":
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        try:
+            await send_public_post(context.bot, pending)
+            if POST_CHANNEL_ID:
+                await q.message.reply_text(
+                    "✅ <b>Posted to channel!</b>",
+                    parse_mode="HTML",
+                )
+            else:
+                await q.message.reply_text(
+                    "✅ <b>Done!</b> POST_CHANNEL_ID not set - sent to you.\nSet it in Railway to auto-post.",
+                    parse_mode="HTML",
+                )
+        except Exception as e:
+            await q.message.reply_text(
+                f"❌ Failed to post: {e}\nCheck POST_CHANNEL_ID and bot admin rights.",
+                parse_mode="HTML",
+            )
+
+        _pending_post.pop(user_id, None)
+        return
+
+    if q.data.startswith("pc_delay_"):
+        try:
+            delay_seconds = int(q.data.split("_")[-1])
+        except ValueError:
+            await q.answer("Invalid schedule.", show_alert=True)
+            return
+
+        try:
+            scheduled_for = await create_scheduled_post(pending, delay_seconds)
+        except DuplicateKeyError:
+            await q.answer("This post is already scheduled.", show_alert=True)
+            return
+        except Exception as exc:
+            await q.answer("Failed to save schedule.", show_alert=True)
+            await q.message.reply_text(
+                f"❌ Could not schedule this post: {exc}",
+                parse_mode="HTML",
+            )
+            return
+
+        _pending_post.pop(user_id, None)
+
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        await q.message.reply_text(
+            "⏰ <b>Post scheduled.</b>\n\n"
+            f"Delay: <code>{html.escape(SCHEDULE_LABELS.get(delay_seconds, str(delay_seconds)))}</code>\n"
+            f"Time: <code>{format_schedule_time(scheduled_for)}</code>\n"
+            f"Thumbnail saved: <code>{'yes' if pending.get('thumb') else 'no'}</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    if q.data == "pc_rot":
+        pending['caption'] = secrets.choice(
+            [c for c in CAPTIONS if c != pending['caption']]
+        )
+        try:
+            await q.edit_message_caption(
+                caption=build_post_caption(pending),
+                parse_mode="HTML",
+                reply_markup=preview_kb(),
+            )
+        except Exception:
+            pass
+        return
+
+    if q.data == "pc_rethumb":
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await q.message.reply_text(
+            "Send me a <b>new thumbnail</b>:\n(or /skip to post without)",
+            parse_mode="HTML",
+        )
+        return
+
+    if q.data == "pc_cancel":
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await q.message.reply_text("❌ Post cancelled.", parse_mode="HTML")
+        _pending_post.pop(user_id, None)
+
+
+async def on_startup(application) -> None:
+    await ensure_runtime_indexes()
+    application.bot_data["scheduled_post_task"] = application.create_task(
+        scheduled_post_poller(application)
+    )
+
+
+async def on_shutdown(application) -> None:
+    scheduled_task = application.bot_data.get("scheduled_post_task")
+    if scheduled_task:
+        scheduled_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await scheduled_task
+    client.close()
+
+
 if __name__ == '__main__':
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(on_startup)
+        .post_shutdown(on_shutdown)
+        .build()
+    )
 
     # Commands
     app.add_handler(CommandHandler("start", start))
@@ -879,8 +1515,13 @@ if __name__ == '__main__':
     # Force-join verify callback
     app.add_handler(CallbackQueryHandler(force_join_check, pattern="^check_join$"))
 
-    # Admin panel buttons (stats/status/refresh)
-    app.add_handler(CallbackQueryHandler(admin_buttons, pattern="^(stats|status|refresh)$"))
+    # Admin panel buttons (stats/status/scheduled/refresh)
+    app.add_handler(
+        CallbackQueryHandler(
+            admin_buttons,
+            pattern="^(stats|status|refresh|sched_list|sched_refresh|sched_back)$",
+        )
+    )
 
     # Post preview buttons (send/rotate/rethumb/cancel)
     app.add_handler(CallbackQueryHandler(post_callback, pattern="^pc_"))

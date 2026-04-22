@@ -6,6 +6,7 @@ Telegram bot for Railway that:
 - creates token-based download links,
 - checks force-join before delivery,
 - posts previews to a channel,
+- can schedule approved posts for fixed delays,
 - tracks users and downloads in MongoDB,
 - optionally censors thumbnails with Pillow + NudeNet.
 
@@ -33,6 +34,24 @@ Set these in Railway service variables:
 - `GATEWAY_URL`: Your site or bot link base used to build `?token=...` URLs.
 - `CENSOR_STYLE`: Optional. `blur`, `pixelate`, or `black`.
 - `CENSOR_THRESHOLD`: Optional detection threshold, for example `0.15`.
+- `SCHEDULE_POLL_SECONDS`: Optional. How often the bot checks MongoDB for due scheduled posts. Default is `15`.
+
+If you want the 10-minute auto-delete warning to actually delete files later, make sure Railway installs the dependencies from `requirements.txt`, which now includes `APScheduler` for the Telegram job queue.
+
+## Scheduled posting
+
+After the admin sends a thumbnail and sees the preview, the bot now shows inline delay buttons:
+
+- `10m`
+- `30m`
+- `2h`
+- `6h`
+- `12h`
+- `24h`
+
+When you tap one, the bot saves the post in MongoDB and publishes it later from the same worker. The saved schedule includes the generated caption, link, and the Telegram thumbnail `file_id`, so scheduled posts survive bot restarts.
+
+The admin panel also includes a `Scheduled Posts` button to inspect pending items and refresh the queue view.
 
 ## Important hardcoded values
 
