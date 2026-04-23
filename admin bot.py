@@ -233,10 +233,9 @@ def preview_kb():
 
 
 def get_channel_kb(link: str):
-    """Get keyboard for channel posts with Watch Now + How to Open Link buttons."""
+    """Get keyboard for channel posts."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("▶️ Watch Now", url=link)],
-        [InlineKeyboardButton("📖 How to Open Link", url=HOW_TO_OPEN_LINK)],
     ])
 
 
