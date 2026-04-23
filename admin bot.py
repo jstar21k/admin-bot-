@@ -343,10 +343,6 @@ async def send_public_post(bot: Bot, post_data: dict):
             reply_markup=get_channel_kb(link),
         )
 
-    if STORAGE_CHANNEL_ID:
-        with suppress(Exception):
-            await bot.send_message(chat_id=STORAGE_CHANNEL_ID, text="post done")
-
     return sent_message, target_chat_id
 
 
@@ -1500,6 +1496,9 @@ async def skip_thumb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "✅ <b>Done!</b> POST_CHANNEL_ID not set - sent to you.\nSet it in Railway to auto-post.",
                 parse_mode="HTML",
             )
+        if STORAGE_CHANNEL_ID:
+            with suppress(Exception):
+                await context.bot.send_message(chat_id=STORAGE_CHANNEL_ID, text="post done")
     except Exception as e:
         await update.message.reply_text(
             f"❌ Failed to post: {e}\nCheck POST_CHANNEL_ID and bot admin rights.",
@@ -1537,6 +1536,9 @@ async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "✅ <b>Done!</b> POST_CHANNEL_ID not set - sent to you.\nSet it in Railway to auto-post.",
                     parse_mode="HTML",
                 )
+            if STORAGE_CHANNEL_ID:
+                with suppress(Exception):
+                    await context.bot.send_message(chat_id=STORAGE_CHANNEL_ID, text="post done")
         except Exception as e:
             await q.message.reply_text(
                 f"❌ Failed to post: {e}\nCheck POST_CHANNEL_ID and bot admin rights.",
