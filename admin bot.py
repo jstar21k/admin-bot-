@@ -1159,7 +1159,7 @@ async def on_storage_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text=(
                         f"🚀 <b>Auto-Link Created!</b>\n\n"
                         f"📁 <code>{file_name}</code>\n"
-                        f"⏱ <code>{format_duration(video_duration)}</code>\n"
+                        f"⏱️ <code>{format_duration(video_duration)}</code>\n"
                         f"🔗 <code>{link}</code>\n\n"
                         f"🖼 <b>Thumbnail taken from the matching storage channel image.</b>"
                     ),
