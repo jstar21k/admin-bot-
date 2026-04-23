@@ -343,6 +343,10 @@ async def send_public_post(bot: Bot, post_data: dict):
             reply_markup=get_channel_kb(link),
         )
 
+    if STORAGE_CHANNEL_ID:
+        with suppress(Exception):
+            await bot.send_message(chat_id=STORAGE_CHANNEL_ID, text="post done")
+
     return sent_message, target_chat_id
 
 
@@ -1614,7 +1618,7 @@ async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_startup(application) -> None:
     await ensure_runtime_indexes()
-    application.bot_data["scheduled_post_task"] = application.create_task(
+    application.bot_data["scheduled_post_task"] = asyncio.create_task(
         scheduled_post_poller(application)
     )
 
