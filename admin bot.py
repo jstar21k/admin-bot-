@@ -90,9 +90,10 @@ CAPTIONS = [
 ]
 
 # ━━━ PENDING POST STATE (in-memory) ━━━━━━━━━━━━━━━━━━━━━━━━━
-# When admin uploads to storage, bot auto-asks for thumbnail.
-# This dict holds the pending post info until flow completes.
+# When media lands in storage, this dict holds the pending post info
+# until the matched storage thumbnail or later preview flow completes.
 _pending_post = {}  # user_id -> {token, name, duration, thumb, caption, preview_msg_id}
+_storage_thumbnail_candidate = None  # last unmatched storage-channel image for the single-post flow
 
 SCHEDULE_OPTIONS = (
     ("10m", 10 * 60),
@@ -286,6 +287,27 @@ def get_post_link(post_data: dict) -> str:
 
 def build_post_caption(post_data: dict) -> str:
     return f"{post_data['caption']}\n\nâ± Duration: {post_data['duration']}"
+
+
+def is_storage_thumbnail_post(post) -> bool:
+    if post.photo:
+        return True
+    mime_type = (getattr(post.document, "mime_type", None) or "").lower()
+    return bool(post.document and mime_type.startswith("image/"))
+
+
+def get_storage_thumbnail_post_file_id(post) -> str | None:
+    if post.photo:
+        return post.photo[-1].file_id
+    if is_storage_thumbnail_post(post):
+        return post.document.file_id
+    return None
+
+
+def is_matching_storage_thumbnail(media_message_id: int | None, thumb_message_id: int | None) -> bool:
+    if not isinstance(media_message_id, int) or not isinstance(thumb_message_id, int):
+        return False
+    return abs(media_message_id - thumb_message_id) == 1
 
 
 def get_post_media(post_data: dict):
@@ -685,6 +707,21 @@ def get_thumb_media(pending: dict):
     return None
 
 
+async def send_pending_preview(bot: Bot, pending: dict):
+    preview_msg = await bot.send_photo(
+        chat_id=ADMIN_USER_ID,
+        photo=get_thumb_media(pending),
+        caption=build_post_caption(pending),
+        parse_mode="HTML",
+        reply_markup=preview_kb(),
+    )
+    if preview_msg.photo:
+        pending['thumb'] = preview_msg.photo[-1].file_id
+    pending['preview_msg_id'] = preview_msg.message_id
+    pending['preview_chat_id'] = preview_msg.chat_id
+    pending.pop('awaiting_storage_thumb', None)
+
+
 async def is_joined(bot: Bot, user_id: int) -> bool:
     """Smart join check: API first, DB fallback if API fails.
     Once a user is verified as joined, save to DB so they
@@ -1004,13 +1041,70 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  STORAGE UPLOAD → AUTO-LINK + ASK THUMBNAIL
+#  STORAGE UPLOAD → AUTO-LINK + STORAGE THUMBNAIL
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 async def on_storage_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """File uploaded to storage channel → save to DB, send link, ask for thumbnail."""
+    """Handle one storage media upload and one matching storage thumbnail image."""
+    global _storage_thumbnail_candidate
     post = update.channel_post
     if not post or post.chat_id != STORAGE_CHANNEL_ID:
+        return
+
+    if is_storage_thumbnail_post(post):
+        thumb_file_id = get_storage_thumbnail_post_file_id(post)
+        if not thumb_file_id:
+            logging.warning("Storage thumbnail message %s has no usable file_id.", post.message_id)
+            return
+
+        pending = _pending_post.get(ADMIN_USER_ID)
+        if pending and pending.get('awaiting_storage_thumb'):
+            if not is_matching_storage_thumbnail(pending.get('storage_msg_id'), post.message_id):
+                logging.warning(
+                    "Storage thumbnail message %s did not clearly match storage media message %s for token %s; leaving post pending.",
+                    post.message_id,
+                    pending.get('storage_msg_id'),
+                    pending.get('token'),
+                )
+                return
+
+            pending['thumb'] = thumb_file_id
+            _storage_thumbnail_candidate = None
+
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_USER_ID,
+                    text="🖼 <b>Matching thumbnail found in the storage channel.</b>\nPreview is ready below.",
+                    parse_mode="HTML",
+                )
+                await send_pending_preview(context.bot, pending)
+            except Exception:
+                logging.exception(
+                    "Failed to build preview after matching storage thumbnail for token %s",
+                    pending.get('token'),
+                )
+            return
+
+        if pending:
+            logging.warning(
+                "Ignoring storage thumbnail message %s because token %s is already in preview/schedule flow.",
+                post.message_id,
+                pending.get('token'),
+            )
+            return
+
+        if _storage_thumbnail_candidate:
+            logging.warning(
+                "Replacing unmatched storage thumbnail message %s with newer message %s.",
+                _storage_thumbnail_candidate.get('message_id'),
+                post.message_id,
+            )
+
+        _storage_thumbnail_candidate = {
+            'message_id': post.message_id,
+            'file_id': thumb_file_id,
+        }
+        logging.info("Stored storage thumbnail candidate from message %s.", post.message_id)
         return
 
     att = post.effective_attachment
@@ -1043,8 +1137,51 @@ async def on_storage_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     })
 
     link = f"{GATEWAY_URL}?token={token}"
+    pending = {
+        'token': token,
+        'name': file_name,
+        'duration': format_duration(video_duration),
+        'link': link,
+        'caption': secrets.choice(CAPTIONS),
+        'storage_msg_id': post.message_id,
+        'awaiting_storage_thumb': True,
+    }
+    _pending_post[ADMIN_USER_ID] = pending
 
-    # ── Send link to admin ──
+    if _storage_thumbnail_candidate:
+        if is_matching_storage_thumbnail(post.message_id, _storage_thumbnail_candidate.get('message_id')):
+            pending['thumb'] = _storage_thumbnail_candidate['file_id']
+            _storage_thumbnail_candidate = None
+
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_USER_ID,
+                    text=(
+                        f"🚀 <b>Auto-Link Created!</b>\n\n"
+                        f"📁 <code>{file_name}</code>\n"
+                        f"⏱ <code>{format_duration(video_duration)}</code>\n"
+                        f"🔗 <code>{link}</code>\n\n"
+                        f"🖼 <b>Thumbnail taken from the matching storage channel image.</b>"
+                    ),
+                    parse_mode="HTML",
+                )
+                await send_pending_preview(context.bot, pending)
+            except Exception:
+                logging.exception(
+                    "Failed to reuse matching storage thumbnail for token %s",
+                    token,
+                )
+            return
+
+        logging.warning(
+            "Storage thumbnail message %s did not clearly match new storage media message %s for token %s; post will stay pending.",
+            _storage_thumbnail_candidate.get('message_id'),
+            post.message_id,
+            token,
+        )
+        _storage_thumbnail_candidate = None
+
+    # ── Send link to admin and wait for matching storage thumbnail ──
     try:
         await context.bot.send_message(
             chat_id=ADMIN_USER_ID,
@@ -1053,22 +1190,15 @@ async def on_storage_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📁 <code>{file_name}</code>\n"
                 f"⏱ <code>{format_duration(video_duration)}</code>\n"
                 f"🔗 <code>{link}</code>\n\n"
-                f"📸 <b>Now send me a thumbnail</b> to create the post!\n"
+                f"🖼 <b>Waiting for the matching thumbnail image from the storage channel.</b>\n"
+                f"The post will stay pending until it arrives there.\n"
                 f"(or send /skip to post without thumbnail)"
             ),
             parse_mode="HTML",
         )
     except Exception:
         logging.error("Failed to notify admin.")
-        return
-
-    # ── Set pending post state — waiting for thumbnail ──
-    _pending_post[ADMIN_USER_ID] = {
-        'token': token,
-        'name': file_name,
-        'duration': format_duration(video_duration),
-        'link': link,
-    }
+        _pending_post.pop(ADMIN_USER_ID, None)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1531,9 +1661,9 @@ if __name__ == '__main__':
         on_admin_photo,
     ))
 
-    # Storage channel upload → auto-link + ask thumbnail
+    # Storage channel upload → auto-link + storage thumbnail matching
     app.add_handler(MessageHandler(
-        filters.Chat(STORAGE_CHANNEL_ID) & (filters.VIDEO | filters.Document.ALL | filters.AUDIO),
+        filters.Chat(STORAGE_CHANNEL_ID) & (filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.AUDIO),
         on_storage_upload,
     ))
 
