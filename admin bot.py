@@ -1614,7 +1614,7 @@ async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_startup(application) -> None:
     await ensure_runtime_indexes()
-    application.bot_data["scheduled_post_task"] = application.create_task(
+    application.bot_data["scheduled_post_task"] = asyncio.create_task(
         scheduled_post_poller(application)
     )
 
