@@ -343,6 +343,10 @@ async def send_public_post(bot: Bot, post_data: dict):
             reply_markup=get_channel_kb(link),
         )
 
+    if STORAGE_CHANNEL_ID:
+        with suppress(Exception):
+            await bot.send_message(chat_id=STORAGE_CHANNEL_ID, text="post done")
+
     return sent_message, target_chat_id
 
 
