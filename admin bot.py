@@ -1123,7 +1123,7 @@ async def skip_thumb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     link = f"{GATEWAY_URL}?token={pending['token']}"
-    cap = f"{secrets.choice(CAPTIONS)}\n\n⏱ Duration: {pending['duration']}"
+    cap = f"{secrets.choice(CAPTIONS)}\n\n⏱️ Duration: {pending['duration']}"
 
     # Post directly to channel with BOTH buttons
     if POST_CHANNEL_ID:
