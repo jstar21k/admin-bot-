@@ -286,7 +286,7 @@ def get_post_link(post_data: dict) -> str:
 
 
 def build_post_caption(post_data: dict) -> str:
-    return f"{post_data['caption']}\n\nâ± Duration: {post_data['duration']}"
+    return f"{post_data['caption']}\n\n⏱️ Duration: {post_data['duration']}"
 
 
 def is_storage_thumbnail_post(post) -> bool:
