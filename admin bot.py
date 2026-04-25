@@ -153,6 +153,44 @@ CAPTIONS = [
     "Ye angle kisi ne nahi dekha hoga! 📸😲 Unique clip!",
 ]
 
+CAPTIONS = [
+    "Bas ek jhalki... 😏 Baaki 90% video dekhne ke liye neeche link par click karo! 👇🔗",
+    "Thumbnail mein toh bas shuruwat hai! 🤯 Full action ke liye link niche hai! ⬇️🔥",
+    "Ye photo dekh ke mat rukna! 🛑 Asli video ke liye neeche wala button dabao! 👇🎬",
+    "Agar ye thumbnail pasand aaya, toh video dekh ke toh paagal ho jaoge! 😲 Link below! ⬇️",
+    "Sirf 10% hi dikha raha hu... 😈 Baaki 90% ke liye neeche click karo! 👇💎",
+    "Picture abhi baaki hai mere dost! 🎬 Full clip ke liye link niche hai! ⬇️🔥",
+    "Isse zyada bold video hai! 🥵 Thumbnail se mat judge karo, link click karo! 👇🔗",
+    "Wait for the movement... 💃 Full video ke liye neeche wala link use karo! ⬇️🌊",
+    "Ye static image nahi, ye trap hai! 🪤 Andar aane ke liye link par click karo! 👇😏",
+    "Thumbnail freeze hai, par video fire hai! 🔥 Full experience ke liye niche jao! ⬇️",
+    "HD Quality ka asli maza link click karne ke baad hi aayega! 🎥💎 Link below! 👇",
+    "Private collection ka hissa... 🤫 Full access ke liye neeche wale link par jao! ⬇️🔒",
+    "Editing ka asli jaadu video mein hai! 🎬✨ Dekhne ke liye link niche hai! 👇",
+    "Sound on karke dekhna padega! 🎧 Full audio-video sync ke liye link click karo! ⬇️🔊",
+    "4K clarity sirf link ke baad! 📲 High Res version ke liye neeche click karo! 👇💯",
+    "Uncut version yahan nahi, link par hai! ✂️❌ Full video ke liye niche jao! ⬇️",
+    "Exclusive content alert! 🚨 Sirf link click karne walon ke liye! 👇🔗",
+    "Best angle sirf video mein dikhta hai! 📸😲 Full view ke liye link niche hai! ⬇️",
+    "Vibes alag hain full video mein! ✨ Feel karne ke liye link par click karo! 👇🔥",
+    "No watermark, pure quality! 💧❌ Clean version ke liye neeche link hai! ⬇️",
+    "Link expire hone wala hai! ⏳ Jaldi click karo aur dekho! 👇🏃‍♂️",
+    "Abhi dekho, baad mein regret mat karna! 😱 Link niche hai! ⬇️🔥",
+    "Sirf aaj ke liye open hai! 📅 Full video ke liye abhi click karo! 👇🔗",
+    "Mat socho, bas click karo! 🖱️😏 Link below for full surprise! ⬇️",
+    "Apne friends ko bhi bhejo, par pehle khud dekh lo! 😂👇 Link niche hai! ⬇️",
+    "Scroll mat karo! 🛑 Ruko aur neeche wale link par click karo! 👇🔥",
+    "Full video dekhne ka mauka mat gawaao! ❌ Link below! ⬇️💎",
+    "Click karke dekho, shukriya khud bolo ge! 😏🙏 Link niche hai! 👇",
+    "Direct link hai, koi tension nahi! 🔗 Seedha video ke liye neeche click karo! ⬇️",
+    "Last chance to watch! ⏰ Full clip ke liye link niche hai! 👇🔥",
+    "Himmat hai toh link click karo! 😈🔥 Full dare below! ⬇️",
+    "Ye dekh ke phone garam ho jayega! 🥵📱 Cool down karne ke liye link click karo! 👇",
+    "Night mode on karo aur link click karo! 🌙😏 Full vibe niche hai! ⬇️",
+    "Control kho doge! 🤯 Full video ke liye neeche wala link best hai! 👇🔥",
+    "Sharamani shuruwat... 😜 Baaki sab link par hai! Click now! ⬇️🔗",
+]
+
 CENSOR_STYLE = os.environ.get("CENSOR_STYLE", "blur").strip().lower()
 try:
     CENSOR_THRESHOLD = float(os.environ.get("CENSOR_THRESHOLD", "0.15"))
@@ -1035,7 +1073,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data = await users_col.find_one({"user_id": user.id})
     if user_data and user_data.get("channel_joined"):
         await update.message.reply_text(
-            "👋 Welcome back!\n\nSend me a link to get your file.",
+            "👋 Welcome back!\n\nTo get /see videos - @link69_viral",
             parse_mode="HTML",
         )
         return
@@ -1044,7 +1082,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     joined = await is_joined(context.bot, user.id)
     if joined:
         await update.message.reply_text(
-            "👋 Welcome back!\n\nSend me a link to get your file.",
+            "👋 Welcome back!\n\nTo get /see videos - @link69_viral",
             parse_mode="HTML",
         )
     else:
@@ -1160,7 +1198,7 @@ async def force_join_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     await q.edit_message_text(
-        "✅ <b>Welcome!</b>\n\nNow send me your link to get the file.",
+        "✅ <b>Welcome!</b>\n\nTo get /see videos - @link69_viral",
         parse_mode="HTML",
     )
 
