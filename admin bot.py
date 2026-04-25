@@ -105,6 +105,53 @@ SCHEDULE_OPTIONS = (
 )
 SCHEDULE_LABELS = {seconds: label for label, seconds in SCHEDULE_OPTIONS}
 SCHEDULE_LIST_LIMIT = 10
+AUTO_BATCH_SLOTS = (
+    (6, 0, "6:00 AM"),
+    (11, 0, "11:00 AM"),
+    (16, 0, "4:00 PM"),
+    (21, 0, "9:00 PM"),
+)
+AUTO_BATCH_LIMIT = 10
+AUTO_BATCH_LOOKAHEAD_DAYS = 21
+CAPTION_ROTATION_STATE_ID = "caption_rotation_state"
+
+CAPTIONS = [
+    "End tak dekhoge toh hairan reh jaoge! 😲🔥",
+    "Ye miss mat karna... last second mein twist hai! 🤯",
+    "Kya aapne wo detail notice ki? 🧐 Dobara dekho!",
+    "Sirf 10% log hi iska matlab samajh paaye. 🤫",
+    "Wait for it... 🎧 Sound on karke dekho!",
+    "Ye clip viral kyun ho rahi hai? Reason jaan lo. 👇",
+    "Aankhon pe yakeen nahi hoga! 👀✨ Must watch.",
+    "Galti se bhi skip mat karna! ⏳ Value hai isme.",
+    "Isse pehle delete ho jaye, save kar lo! 💾🏃‍♂️",
+    "Log pooch rahe hain 'Ye kaise kiya?' 😏 Secret revealed.",
+    "4K clarity ka asli maza! 🎥💎 Headphones recommended.",
+    "Editing next level hai! 🎬 Rate karo 1-10?",
+    "Vibes check! ✨ Agar pasand aaye toh 🔥 react karo.",
+    "Crystal clear audio + Visuals. 🎧😍 Perfect combo.",
+    "Cinematic feel ghar baithe. 🌆🔥 Dekh ke batao.",
+    "Best quality version yahan available hai! 📲💯",
+    "Thoda unique, thoda crazy! 😜💦 Enjoy!",
+    "Apne best friend ke saath share karo! 😂👇 Tag him.",
+    "Subah ki shuruwat isi ke saath! ☀️😈 Day made.",
+    "Private collection se... special for subscribers! 🤫💎",
+    "No words, just vibes. 🔥👇",
+    "Save for later! ⏳ You'll need this.",
+    "Double tap if you agree! ❤️👇",
+    "Comment 'YES' agar full video chahiye! 💬🔥",
+    "Link bio/page par hai, jaldi grab karo! 🏃‍♂️💨",
+    "Seedha dil pe lagega! 💘🔥 Dekh ke batao kaisa laga?",
+    "Raat ki neend uddane wali clip 😈💦 Full HD quality!",
+    "Ye dekh ke phone side mein rakh dena... control nahi hoga! 🥵",
+    "Bina sound ke mat dekhna! 🎧 Awaz mein jaadu hai 😏",
+    "Itna bold content TG pe? 😲 Screenshot mat lena, bas dekho!",
+    "Aankhein phati ki phati reh jayengi! 👀🔥 End miss mat karna.",
+    "Ye wali movement next level hai! 🌊💃 Rate karo 1-10?",
+    "Dil ki dhadkan tez kar dega! ❤️‍🔥 Headphones recommended.",
+    "Kal raat viral hua tha, ab yahan available! 🔥📲",
+    "Ye angle kisi ne nahi dekha hoga! 📸😲 Unique clip!",
+]
 
 CENSOR_STYLE = os.environ.get("CENSOR_STYLE", "blur").strip().lower()
 try:
@@ -243,25 +290,12 @@ def get_channel_kb(link: str):
 def admin_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Statistics", callback_data="stats")],
-        [InlineKeyboardButton("System Status", callback_data="status")],
         [InlineKeyboardButton("Scheduled Posts", callback_data="sched_list")],
-        [InlineKeyboardButton("Refresh", callback_data="refresh")],
     ])
 
 
 def preview_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Send Now", callback_data="pc_send"),
-         InlineKeyboardButton("New Caption", callback_data="pc_rot")],
-        [InlineKeyboardButton("10m", callback_data="pc_delay_600"),
-         InlineKeyboardButton("30m", callback_data="pc_delay_1800"),
-         InlineKeyboardButton("2h", callback_data="pc_delay_7200")],
-        [InlineKeyboardButton("6h", callback_data="pc_delay_21600"),
-         InlineKeyboardButton("12h", callback_data="pc_delay_43200"),
-         InlineKeyboardButton("24h", callback_data="pc_delay_86400")],
-        [InlineKeyboardButton("New Thumb", callback_data="pc_rethumb"),
-         InlineKeyboardButton("Cancel", callback_data="pc_cancel")],
-    ])
+    return None
 
 
 def scheduled_list_kb():
@@ -275,10 +309,76 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+async def pick_next_caption(exclude: str | None = None) -> str:
+    available = list(CAPTIONS)
+    if exclude and len(available) > 1:
+        available = [caption for caption in available if caption != exclude]
+
+    state = await runtime_col.find_one({"_id": CAPTION_ROTATION_STATE_ID})
+    remaining = [
+        caption for caption in (state or {}).get("remaining", [])
+        if caption in available
+    ]
+    if not remaining:
+        remaining = available[:]
+        secrets.SystemRandom().shuffle(remaining)
+
+    caption = remaining.pop(0)
+    await runtime_col.update_one(
+        {"_id": CAPTION_ROTATION_STATE_ID},
+        {
+            "$set": {
+                "remaining": remaining,
+                "updated_at": utc_now(),
+            }
+        },
+        upsert=True,
+    )
+    return caption
+
+
 def format_schedule_time(value: datetime | None) -> str:
     if not isinstance(value, datetime):
         return "N/A"
     return value.astimezone(DISPLAY_TIMEZONE).strftime("%d %b %I:%M %p IST")
+
+
+def iter_upcoming_batch_slots(start_time: datetime | None = None):
+    current_time = start_time or utc_now()
+    current_local = current_time.astimezone(DISPLAY_TIMEZONE)
+    start_date = current_local.date()
+
+    for day_offset in range(AUTO_BATCH_LOOKAHEAD_DAYS):
+        slot_date = start_date + timedelta(days=day_offset)
+        for hour, minute, label in AUTO_BATCH_SLOTS:
+            slot_local = datetime(
+                slot_date.year,
+                slot_date.month,
+                slot_date.day,
+                hour,
+                minute,
+                tzinfo=DISPLAY_TIMEZONE,
+            )
+            slot_utc = slot_local.astimezone(timezone.utc)
+            if slot_utc > current_time:
+                yield slot_utc, label
+
+
+async def count_batch_slot_posts(scheduled_for: datetime) -> int:
+    return await scheduled_posts_col.count_documents(
+        {
+            "status": {"$in": ["scheduled", "posting"]},
+            "scheduled_for": scheduled_for,
+        }
+    )
+
+
+async def get_next_auto_schedule_slot() -> tuple[datetime, str, int]:
+    for scheduled_for, batch_label in iter_upcoming_batch_slots():
+        booked_count = await count_batch_slot_posts(scheduled_for)
+        if booked_count < AUTO_BATCH_LIMIT:
+            return scheduled_for, batch_label, booked_count + 1
+    raise RuntimeError("No free auto-schedule batch slot found in the next 21 days.")
 
 
 def get_post_link(post_data: dict) -> str:
@@ -369,6 +469,33 @@ async def create_scheduled_post(pending: dict, delay_seconds: int) -> datetime:
         "target_message_id": None,
     })
     return scheduled_for
+
+
+async def create_auto_scheduled_post(pending: dict) -> tuple[datetime, str, int]:
+    now = utc_now()
+    scheduled_for, batch_label, batch_position = await get_next_auto_schedule_slot()
+    delay_seconds = max(0, int((scheduled_for - now).total_seconds()))
+    delay_label = f"Batch {batch_label} #{batch_position}"
+    await scheduled_posts_col.insert_one({
+        "token": pending["token"],
+        "file_name": pending["name"],
+        "caption": pending["caption"],
+        "duration": pending["duration"],
+        "thumbnail_file_id": pending.get("thumb"),
+        "link": get_post_link(pending),
+        "status": "scheduled",
+        "delay_seconds": delay_seconds,
+        "delay_label": delay_label,
+        "scheduled_for": scheduled_for,
+        "created_at": now,
+        "updated_at": now,
+        "sent_at": None,
+        "failed_at": None,
+        "last_error": None,
+        "target_chat_id": POST_CHANNEL_ID or ADMIN_USER_ID,
+        "target_message_id": None,
+    })
+    return scheduled_for, delay_label, batch_position
 
 
 async def claim_due_scheduled_post() -> dict | None:
@@ -476,7 +603,30 @@ async def ensure_runtime_indexes() -> None:
     )
 
 
+async def get_database_status_label() -> str:
+    try:
+        await client.admin.command("ping")
+        return "Connected"
+    except Exception:
+        return "Disconnected"
+
+
+async def build_next_batch_lines(limit: int = 4) -> list[str]:
+    lines = []
+    for index, (scheduled_for, batch_label) in enumerate(iter_upcoming_batch_slots(), start=1):
+        booked_count = await count_batch_slot_posts(scheduled_for)
+        lines.append(
+            f"{index}. <code>{format_schedule_time(scheduled_for)}</code> | "
+            f"<code>{booked_count}/{AUTO_BATCH_LIMIT}</code> | "
+            f"<code>{html.escape(batch_label)}</code>"
+        )
+        if index >= limit:
+            break
+    return lines
+
+
 async def build_admin_home_text() -> str:
+    db_status = await get_database_status_label()
     pending_count = await scheduled_posts_col.count_documents({"status": "scheduled"})
     failed_count = await scheduled_posts_col.count_documents({"status": "failed"})
     next_post = await scheduled_posts_col.find_one(
@@ -487,6 +637,8 @@ async def build_admin_home_text() -> str:
     lines = [
         "<b>JSTAR PRO ADMIN PANEL</b>",
         "",
+        f"System status: <code>Running</code>",
+        f"MongoDB: <code>{db_status}</code>",
         f"Pending scheduled posts: <code>{pending_count}</code>",
         f"Failed scheduled posts: <code>{failed_count}</code>",
     ]
@@ -499,8 +651,17 @@ async def build_admin_home_text() -> str:
     else:
         lines.append("Next scheduled post: <code>None</code>")
 
+    batch_lines = await build_next_batch_lines()
+    if batch_lines:
+        lines.extend([
+            "",
+            "<b>Upcoming batch slots</b>",
+            *batch_lines,
+        ])
+
     lines.extend([
         "",
+        "Auto-schedule batches: <code>6 AM, 11 AM, 4 PM, 9 PM</code>",
         "Upload a file to storage to start a new post.",
     ])
     return "\n".join(lines)
@@ -543,6 +704,44 @@ async def build_scheduled_posts_text(limit: int = SCHEDULE_LIST_LIMIT) -> str:
         ])
 
     return "\n".join(lines)
+
+
+async def auto_schedule_pending_post(
+    bot: Bot,
+    pending: dict,
+    pending_user_id: int | None = None,
+) -> tuple[datetime, str]:
+    scheduled_for, delay_label, _batch_position = await create_auto_scheduled_post(pending)
+    if pending_user_id is not None:
+        _pending_post.pop(pending_user_id, None)
+    if STORAGE_CHANNEL_ID:
+        try:
+            await bot.send_message(chat_id=STORAGE_CHANNEL_ID, text="post done")
+        except Exception:
+            logging.exception(
+                "Failed to send post completion signal for token %s",
+                pending.get("token"),
+            )
+    return scheduled_for, delay_label
+
+
+async def send_auto_schedule_confirmation(bot: Bot, pending: dict, scheduled_for: datetime, delay_label: str) -> None:
+    try:
+        await bot.send_message(
+            chat_id=ADMIN_USER_ID,
+            text=(
+                "⏰ <b>Post scheduled automatically.</b>\n\n"
+                f"Batch: <code>{html.escape(delay_label)}</code>\n"
+                f"Time: <code>{format_schedule_time(scheduled_for)}</code>\n"
+                f"Thumbnail saved: <code>{'yes' if pending.get('thumb') else 'no'}</code>"
+            ),
+            parse_mode="HTML",
+        )
+    except Exception:
+        logging.exception(
+            "Failed to send auto-schedule confirmation for token %s",
+            pending.get("token"),
+        )
 
 
 def get_nude_detector():
@@ -713,7 +912,6 @@ async def send_pending_preview(bot: Bot, pending: dict):
         photo=get_thumb_media(pending),
         caption=build_post_caption(pending),
         parse_mode="HTML",
-        reply_markup=preview_kb(),
     )
     if preview_msg.photo:
         pending['thumb'] = preview_msg.photo[-1].file_id
@@ -1078,6 +1276,13 @@ async def on_storage_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML",
                 )
                 await send_pending_preview(context.bot, pending)
+                scheduled_for, delay_label = await auto_schedule_pending_post(
+                    context.bot,
+                    pending,
+                    pending_user_id=ADMIN_USER_ID,
+                )
+                await send_auto_schedule_confirmation(context.bot, pending, scheduled_for, delay_label)
+                _pending_post.pop(ADMIN_USER_ID, None)
             except Exception:
                 logging.exception(
                     "Failed to build preview after matching storage thumbnail for token %s",
@@ -1142,7 +1347,7 @@ async def on_storage_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'name': file_name,
         'duration': format_duration(video_duration),
         'link': link,
-        'caption': secrets.choice(CAPTIONS),
+        'caption': await pick_next_caption(),
         'storage_msg_id': post.message_id,
         'awaiting_storage_thumb': True,
     }
@@ -1166,6 +1371,13 @@ async def on_storage_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML",
                 )
                 await send_pending_preview(context.bot, pending)
+                scheduled_for, delay_label = await auto_schedule_pending_post(
+                    context.bot,
+                    pending,
+                    pending_user_id=ADMIN_USER_ID,
+                )
+                await send_auto_schedule_confirmation(context.bot, pending, scheduled_for, delay_label)
+                _pending_post.pop(ADMIN_USER_ID, None)
             except Exception:
                 logging.exception(
                     "Failed to reuse matching storage thumbnail for token %s",
@@ -1223,7 +1435,7 @@ async def on_admin_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending['thumb_bytes'] = censor_thumbnail_bytes(
         bytes(await photo_file.download_as_bytearray())
     )
-    pending['caption'] = secrets.choice(CAPTIONS)
+    pending['caption'] = await pick_next_caption()
 
     link = f"{GATEWAY_URL}?token={pending['token']}"
     cap = f"{pending['caption']}\n\n⏱ Duration: {pending['duration']}"
@@ -1232,12 +1444,26 @@ async def on_admin_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photo=build_thumb_inputfile(pending['thumb_bytes']),
         caption=cap,
         parse_mode="HTML",
-        reply_markup=preview_kb(),
     )
     if preview_msg.photo:
         pending['thumb'] = preview_msg.photo[-1].file_id
     pending['preview_msg_id'] = preview_msg.message_id
     pending['preview_chat_id'] = preview_msg.chat_id
+    try:
+        scheduled_for, delay_label = await auto_schedule_pending_post(
+            context.bot,
+            pending,
+            pending_user_id=user_id,
+        )
+        await send_auto_schedule_confirmation(context.bot, pending, scheduled_for, delay_label)
+        _pending_post.pop(user_id, None)
+    except DuplicateKeyError:
+        await update.message.reply_text("❌ This post is already scheduled.", parse_mode="HTML")
+    except Exception as exc:
+        await update.message.reply_text(
+            f"❌ Could not auto-schedule this post: {exc}",
+            parse_mode="HTML",
+        )
 
 
 # ━━━ /skip COMMAND — skip thumbnail, post with caption only ━━━
@@ -1438,24 +1664,6 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if query.data == "status":
-        try:
-            await client.admin.command('ping')
-            db_st = "Connected"
-        except Exception:
-            db_st = "Disconnected"
-
-        scheduled_count = await scheduled_posts_col.count_documents({"status": "scheduled"})
-        await safe_query_edit(
-            query,
-            f"<b>SYSTEM STATUS</b>\n\n"
-            f"MongoDB: <code>{db_st}</code>\n"
-            f"Bot: <code>Running</code>\n"
-            f"Scheduled Pending: <code>{scheduled_count}</code>",
-            admin_kb(),
-        )
-        return
-
     if query.data in {"sched_list", "sched_refresh"}:
         await safe_query_edit(
             query,
@@ -1464,7 +1672,7 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if query.data in {"sched_back", "refresh"}:
+    if query.data in {"status", "sched_back", "refresh"}:
         await safe_query_edit(
             query,
             await build_admin_home_text(),
@@ -1620,6 +1828,181 @@ async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_startup(application) -> None:
     await ensure_runtime_indexes()
+    application.bot_data["scheduled_post_task"] = asyncio.create_task(
+        scheduled_post_poller(application)
+    )
+
+
+async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    del context
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "stats":
+        today_start = utc_now().replace(hour=0, minute=0, second=0, microsecond=0)
+        total_links = await files_col.count_documents({})
+        total_users = await users_col.count_documents({})
+        new_users_today = await users_col.count_documents({
+            "last_seen": {"$gte": today_start}
+        })
+
+        agg_all = await logs_col.aggregate(
+            [{"$group": {"_id": None, "dl": {"$sum": 1}}}]
+        ).to_list(1)
+        total_dl_all = agg_all[0]['dl'] if agg_all else 0
+
+        agg_users = await logs_col.aggregate([
+            {"$match": {"is_admin": {"$ne": True}}},
+            {"$group": {"_id": None, "dl": {"$sum": 1}}}
+        ]).to_list(1)
+        total_dl_users = agg_users[0]['dl'] if agg_users else 0
+
+        today_dl = await logs_col.count_documents({
+            "time": {"$gte": today_start},
+            "is_admin": {"$ne": True}
+        })
+
+        await safe_query_edit(
+            query,
+            f"📊 <b>DETAILED ANALYTICS</b>\n\n"
+            f"👥 Total Users: <code>{total_users}</code>\n"
+            f"👥 New Today: <code>{new_users_today}</code>\n"
+            f"🔗 Total Links: <code>{total_links}</code>\n"
+            f"📥 Downloads (Users): <code>{total_dl_users}</code>\n"
+            f"📥 Downloads (All incl. Admin): <code>{total_dl_all}</code>\n"
+            f"📅 Downloads Today: <code>{today_dl}</code>",
+            admin_kb(),
+        )
+        return
+
+    if query.data in {"status", "sched_back", "refresh"}:
+        await safe_query_edit(
+            query,
+            await build_admin_home_text(),
+            admin_kb(),
+        )
+        return
+
+    if query.data in {"sched_list", "sched_refresh"}:
+        await safe_query_edit(
+            query,
+            await build_scheduled_posts_text(),
+            scheduled_list_kb(),
+        )
+
+
+async def skip_thumb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_USER_ID:
+        return
+
+    pending = _pending_post.get(user_id)
+    if not pending:
+        await update.message.reply_text("❌ No pending post to skip.")
+        return
+
+    pending['caption'] = await pick_next_caption()
+
+    try:
+        scheduled_for, delay_label = await auto_schedule_pending_post(
+            context.bot,
+            pending,
+            pending_user_id=user_id,
+        )
+        await update.message.reply_text(
+            "⏰ <b>Post scheduled automatically.</b>\n\n"
+            f"Batch: <code>{html.escape(delay_label)}</code>\n"
+            f"Time: <code>{format_schedule_time(scheduled_for)}</code>\n"
+            f"Thumbnail saved: <code>{'yes' if pending.get('thumb') else 'no'}</code>",
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        await update.message.reply_text(
+            f"❌ Could not auto-schedule this post: {exc}",
+            parse_mode="HTML",
+        )
+
+    _pending_post.pop(user_id, None)
+
+
+async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    user_id = update.effective_user.id
+
+    pending = _pending_post.get(user_id)
+    if not pending:
+        await q.answer("Session expired.", show_alert=True)
+        return
+
+    if q.data == "pc_send" or q.data.startswith("pc_delay_"):
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        try:
+            scheduled_for, delay_label = await auto_schedule_pending_post(
+                context.bot,
+                pending,
+                pending_user_id=user_id,
+            )
+            await q.message.reply_text(
+                "⏰ <b>Post scheduled automatically.</b>\n\n"
+                f"Batch: <code>{html.escape(delay_label)}</code>\n"
+                f"Time: <code>{format_schedule_time(scheduled_for)}</code>\n"
+                f"Thumbnail saved: <code>{'yes' if pending.get('thumb') else 'no'}</code>",
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            await q.message.reply_text(
+                f"❌ Could not auto-schedule this post: {exc}",
+                parse_mode="HTML",
+            )
+
+        _pending_post.pop(user_id, None)
+        return
+
+    if q.data == "pc_rot":
+        pending['caption'] = await pick_next_caption(exclude=pending.get('caption'))
+        try:
+            await q.edit_message_caption(
+                caption=build_post_caption(pending),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        return
+
+    if q.data == "pc_rethumb":
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await q.message.reply_text(
+            "Send me a <b>new thumbnail</b>:\n(or /skip to post without)",
+            parse_mode="HTML",
+        )
+        return
+
+    if q.data == "pc_cancel":
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await q.message.reply_text("❌ Post cancelled.", parse_mode="HTML")
+        _pending_post.pop(user_id, None)
+
+
+async def on_startup(application) -> None:
+    await ensure_runtime_indexes()
+    try:
+        await application.bot.set_my_commands(
+            [BotCommand("start", "Open the bot dashboard")],
+            scope=BotCommandScopeDefault(),
+        )
+    except Exception:
+        logging.exception("Failed to register bot commands during startup.")
     application.bot_data["scheduled_post_task"] = asyncio.create_task(
         scheduled_post_poller(application)
     )
