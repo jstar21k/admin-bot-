@@ -706,11 +706,22 @@ async def build_scheduled_posts_text(limit: int = SCHEDULE_LIST_LIMIT) -> str:
     return "\n".join(lines)
 
 
-async def auto_schedule_pending_post(bot: Bot, pending: dict) -> tuple[datetime, str]:
+async def auto_schedule_pending_post(
+    bot: Bot,
+    pending: dict,
+    pending_user_id: int | None = None,
+) -> tuple[datetime, str]:
     scheduled_for, delay_label, _batch_position = await create_auto_scheduled_post(pending)
+    if pending_user_id is not None:
+        _pending_post.pop(pending_user_id, None)
     if STORAGE_CHANNEL_ID:
-        with suppress(Exception):
+        try:
             await bot.send_message(chat_id=STORAGE_CHANNEL_ID, text="post done")
+        except Exception:
+            logging.exception(
+                "Failed to send post completion signal for token %s",
+                pending.get("token"),
+            )
     return scheduled_for, delay_label
 
 
@@ -1265,7 +1276,11 @@ async def on_storage_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML",
                 )
                 await send_pending_preview(context.bot, pending)
-                scheduled_for, delay_label = await auto_schedule_pending_post(context.bot, pending)
+                scheduled_for, delay_label = await auto_schedule_pending_post(
+                    context.bot,
+                    pending,
+                    pending_user_id=ADMIN_USER_ID,
+                )
                 await send_auto_schedule_confirmation(context.bot, pending, scheduled_for, delay_label)
                 _pending_post.pop(ADMIN_USER_ID, None)
             except Exception:
@@ -1356,7 +1371,11 @@ async def on_storage_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML",
                 )
                 await send_pending_preview(context.bot, pending)
-                scheduled_for, delay_label = await auto_schedule_pending_post(context.bot, pending)
+                scheduled_for, delay_label = await auto_schedule_pending_post(
+                    context.bot,
+                    pending,
+                    pending_user_id=ADMIN_USER_ID,
+                )
                 await send_auto_schedule_confirmation(context.bot, pending, scheduled_for, delay_label)
                 _pending_post.pop(ADMIN_USER_ID, None)
             except Exception:
@@ -1431,7 +1450,11 @@ async def on_admin_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending['preview_msg_id'] = preview_msg.message_id
     pending['preview_chat_id'] = preview_msg.chat_id
     try:
-        scheduled_for, delay_label = await auto_schedule_pending_post(context.bot, pending)
+        scheduled_for, delay_label = await auto_schedule_pending_post(
+            context.bot,
+            pending,
+            pending_user_id=user_id,
+        )
         await send_auto_schedule_confirmation(context.bot, pending, scheduled_for, delay_label)
         _pending_post.pop(user_id, None)
     except DuplicateKeyError:
@@ -1881,7 +1904,11 @@ async def skip_thumb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending['caption'] = await pick_next_caption()
 
     try:
-        scheduled_for, delay_label = await auto_schedule_pending_post(context.bot, pending)
+        scheduled_for, delay_label = await auto_schedule_pending_post(
+            context.bot,
+            pending,
+            pending_user_id=user_id,
+        )
         await update.message.reply_text(
             "⏰ <b>Post scheduled automatically.</b>\n\n"
             f"Batch: <code>{html.escape(delay_label)}</code>\n"
@@ -1915,7 +1942,11 @@ async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
         try:
-            scheduled_for, delay_label = await auto_schedule_pending_post(context.bot, pending)
+            scheduled_for, delay_label = await auto_schedule_pending_post(
+                context.bot,
+                pending,
+                pending_user_id=user_id,
+            )
             await q.message.reply_text(
                 "⏰ <b>Post scheduled automatically.</b>\n\n"
                 f"Batch: <code>{html.escape(delay_label)}</code>\n"
@@ -1965,10 +1996,13 @@ async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_startup(application) -> None:
     await ensure_runtime_indexes()
-    await application.bot.set_my_commands(
-        [BotCommand("start", "Open the bot dashboard")],
-        scope=BotCommandScopeDefault(),
-    )
+    try:
+        await application.bot.set_my_commands(
+            [BotCommand("start", "Open the bot dashboard")],
+            scope=BotCommandScopeDefault(),
+        )
+    except Exception:
+        logging.exception("Failed to register bot commands during startup.")
     application.bot_data["scheduled_post_task"] = asyncio.create_task(
         scheduled_post_poller(application)
     )
