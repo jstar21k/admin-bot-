@@ -736,41 +736,30 @@ async def build_admin_home_text() -> str:
     lines = [
         "<b>JSTAR PRO ADMIN PANEL</b>",
         "",
-        f"System status: <code>Running</code>",
-        f"MongoDB: <code>{db_status}</code>",
-        f"Pending scheduled posts: <code>{pending_count}</code>",
-        f"Failed scheduled posts: <code>{failed_count}</code>",
+        "🟢 System status: <code>Running</code>",
+        f"🗄️ MongoDB: <code>{db_status}</code>",
+        f"🗓️ Pending scheduled posts: <code>{pending_count}</code>",
+        f"⚠️ Failed scheduled posts: <code>{failed_count}</code>",
     ]
 
     if next_post:
         lines.extend([
-            f"Next scheduled post: <code>{format_schedule_time(next_post['scheduled_for'])}</code>",
-            f"Next file: <code>{html.escape(next_post.get('file_name', 'Post'))}</code>",
+            f"⏭️ Next scheduled post: <code>{format_schedule_time(next_post['scheduled_for'])}</code>",
+            f"📁 Next file: <code>{html.escape(next_post.get('file_name', 'Post'))}</code>",
         ])
     else:
-        lines.append("Next scheduled post: <code>None</code>")
-
-    batch_lines = await build_next_batch_lines()
-    if batch_lines:
-        lines.extend([
-            "",
-            "<b>Upcoming batch slots</b>",
-            *batch_lines,
-        ])
+        lines.append("⏭️ Next scheduled post: <code>None</code>")
 
     lines.extend([
         "",
-        "Auto-schedule batches: <code>6 AM, 11 AM, 4 PM, 9 PM</code>",
-        "Upload a file to storage to start a new post.",
+        "📊 <b>DETAILED ANALYTICS</b>",
         "",
-        "<b>DETAILED ANALYTICS</b>",
-        "",
-        f"Total Users: <code>{total_users}</code>",
-        f"New Today: <code>{new_users_today}</code>",
-        f"Total Links: <code>{total_links}</code>",
-        f"Downloads (Users): <code>{total_dl_users}</code>",
-        f"Downloads (All incl. Admin): <code>{total_dl_all}</code>",
-        f"Downloads Today: <code>{today_dl}</code>",
+        f"👥 Total Users: <code>{total_users}</code>",
+        f"🆕 New Today: <code>{new_users_today}</code>",
+        f"🔗 Total Links: <code>{total_links}</code>",
+        f"📥 Downloads (Users): <code>{total_dl_users}</code>",
+        f"📦 Downloads (All incl. Admin): <code>{total_dl_all}</code>",
+        f"📅 Downloads Today: <code>{today_dl}</code>",
     ])
     return "\n".join(lines)
 
