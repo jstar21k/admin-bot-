@@ -710,6 +710,29 @@ async def build_admin_home_text() -> str:
         sort=[("scheduled_for", 1)],
     )
 
+    today_start = utc_now().replace(hour=0, minute=0, second=0, microsecond=0)
+    total_links = await files_col.count_documents({})
+    total_users = await users_col.count_documents({})
+    new_users_today = await users_col.count_documents({
+        "last_seen": {"$gte": today_start}
+    })
+
+    agg_all = await logs_col.aggregate(
+        [{"$group": {"_id": None, "dl": {"$sum": 1}}}]
+    ).to_list(1)
+    total_dl_all = agg_all[0]['dl'] if agg_all else 0
+
+    agg_users = await logs_col.aggregate([
+        {"$match": {"is_admin": {"$ne": True}}},
+        {"$group": {"_id": None, "dl": {"$sum": 1}}}
+    ]).to_list(1)
+    total_dl_users = agg_users[0]['dl'] if agg_users else 0
+
+    today_dl = await logs_col.count_documents({
+        "time": {"$gte": today_start},
+        "is_admin": {"$ne": True}
+    })
+
     lines = [
         "<b>JSTAR PRO ADMIN PANEL</b>",
         "",
@@ -739,6 +762,15 @@ async def build_admin_home_text() -> str:
         "",
         "Auto-schedule batches: <code>6 AM, 11 AM, 4 PM, 9 PM</code>",
         "Upload a file to storage to start a new post.",
+        "",
+        "<b>DETAILED ANALYTICS</b>",
+        "",
+        f"Total Users: <code>{total_users}</code>",
+        f"New Today: <code>{new_users_today}</code>",
+        f"Total Links: <code>{total_links}</code>",
+        f"Downloads (Users): <code>{total_dl_users}</code>",
+        f"Downloads (All incl. Admin): <code>{total_dl_all}</code>",
+        f"Downloads Today: <code>{today_dl}</code>",
     ])
     return "\n".join(lines)
 
@@ -1102,7 +1134,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.id == ADMIN_USER_ID:
         await update.message.reply_text(
             await build_admin_home_text(),
-            reply_markup=admin_kb(),
             parse_mode="HTML",
         )
         return
