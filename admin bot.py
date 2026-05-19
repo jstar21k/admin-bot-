@@ -133,6 +133,14 @@ LEGACY_CAPTIONS_20 = [
 _pending_post = {}  # user_id -> {token, name, duration, thumb, caption, preview_msg_id}
 _storage_thumbnail_candidate = None  # last unmatched storage-channel image for the single-post flow
 
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+
 SCHEDULE_OPTIONS = (
     ("10m", 10 * 60),
     ("30m", 30 * 60),
@@ -144,14 +152,29 @@ SCHEDULE_OPTIONS = (
 SCHEDULE_LABELS = {seconds: label for label, seconds in SCHEDULE_OPTIONS}
 SCHEDULE_LIST_LIMIT = 10
 AUTO_BATCH_SLOTS = (
-    (6, 0, "6:00 AM"),
-    (11, 0, "11:00 AM"),
-    (16, 0, "4:00 PM"),
-    (21, 0, "9:00 PM"),
+    (0, 6, 0, "6:00 AM"),
+    (0, 8, 0, "8:00 AM"),
+    (0, 10, 0, "10:00 AM"),
+    (0, 12, 0, "12:00 PM"),
+    (0, 14, 0, "2:00 PM"),
+    (0, 16, 0, "4:00 PM"),
+    (0, 18, 0, "6:00 PM"),
+    (0, 20, 0, "8:00 PM"),
+    (0, 22, 0, "10:00 PM"),
+    (1, 0, 0, "12:00 AM"),
 )
-AUTO_BATCH_LIMIT = 10
+AUTO_BATCH_LIMIT = 5
 AUTO_BATCH_LOOKAHEAD_DAYS = 21
 CAPTION_ROTATION_STATE_ID = "caption_rotation_state"
+AUTO_SCHEDULE_LAYOUT_VERSION = "every_2h_6am_to_12am_v1"
+AUTO_SCHEDULE_MIGRATION_ID = "schedule_migration_every_2h_6am_to_12am_v1"
+AUTO_REUSE_STATE_ID = "auto_reuse_material_state"
+AUTO_REUSE_NOTICE_STATE_ID = "auto_reuse_low_queue_notice"
+AUTO_REUSE_NOTIFY_THRESHOLD = _env_int("AUTO_REUSE_NOTIFY_THRESHOLD", 20, 1)
+AUTO_REUSE_REFILL_THRESHOLD = _env_int("AUTO_REUSE_REFILL_THRESHOLD", 10, 0)
+AUTO_REUSE_TARGET_PENDING = _env_int("AUTO_REUSE_TARGET_PENDING", 100, AUTO_BATCH_LIMIT)
+AUTO_REUSE_SOURCE_SCAN_LIMIT = _env_int("AUTO_REUSE_SOURCE_SCAN_LIMIT", 500, 20)
+AUTO_REUSE_NOTICE_COOLDOWN_SECONDS = _env_int("AUTO_REUSE_NOTICE_COOLDOWN_SECONDS", 12 * 60 * 60, 60)
 
 LEGACY_CAPTIONS_35_OLD = [
     "End tak dekhoge toh hairan reh jaoge! 😲🔥",
@@ -419,14 +442,30 @@ def format_schedule_time(value: datetime | None) -> str:
     return value.astimezone(DISPLAY_TIMEZONE).strftime("%d %b %I:%M %p IST")
 
 
-def iter_upcoming_batch_slots(start_time: datetime | None = None):
+def get_next_6am_start(start_time: datetime | None = None) -> datetime:
     current_time = start_time or utc_now()
     current_local = current_time.astimezone(DISPLAY_TIMEZONE)
-    start_date = current_local.date()
+    start_local = current_local.replace(hour=6, minute=0, second=0, microsecond=0)
+    if current_local >= start_local:
+        start_local += timedelta(days=1)
+    return start_local.astimezone(timezone.utc)
+
+
+def iter_upcoming_batch_slots(
+    start_time: datetime | None = None,
+    *,
+    from_next_6am: bool = False,
+):
+    current_time = start_time or utc_now()
+    if from_next_6am:
+        start_date = get_next_6am_start(current_time).astimezone(DISPLAY_TIMEZONE).date()
+    else:
+        start_date = current_time.astimezone(DISPLAY_TIMEZONE).date()
 
     for day_offset in range(AUTO_BATCH_LOOKAHEAD_DAYS):
-        slot_date = start_date + timedelta(days=day_offset)
-        for hour, minute, label in AUTO_BATCH_SLOTS:
+        schedule_date = start_date + timedelta(days=day_offset)
+        for slot_day_offset, hour, minute, label in AUTO_BATCH_SLOTS:
+            slot_date = schedule_date + timedelta(days=slot_day_offset)
             slot_local = datetime(
                 slot_date.year,
                 slot_date.month,
@@ -455,6 +494,86 @@ async def get_next_auto_schedule_slot() -> tuple[datetime, str, int]:
         if booked_count < AUTO_BATCH_LIMIT:
             return scheduled_for, batch_label, booked_count + 1
     raise RuntimeError("No free auto-schedule batch slot found in the next 21 days.")
+
+
+def build_schedule_assignments(
+    item_count: int,
+    start_time: datetime | None = None,
+) -> list[tuple[datetime, str, int]]:
+    assignments = []
+    slots = iter_upcoming_batch_slots(start_time, from_next_6am=True)
+
+    while len(assignments) < item_count:
+        try:
+            scheduled_for, batch_label = next(slots)
+        except StopIteration as exc:
+            raise RuntimeError(
+                f"No free auto-schedule batch slot found for {item_count} posts."
+            ) from exc
+
+        for batch_position in range(1, AUTO_BATCH_LIMIT + 1):
+            assignments.append((scheduled_for, batch_label, batch_position))
+            if len(assignments) >= item_count:
+                break
+
+    return assignments
+
+
+async def reschedule_existing_pending_posts_for_new_layout() -> int:
+    state = await runtime_col.find_one({"_id": AUTO_SCHEDULE_MIGRATION_ID})
+    if state and state.get("layout_version") == AUTO_SCHEDULE_LAYOUT_VERSION:
+        return 0
+
+    posts = await scheduled_posts_col.find(
+        {"status": "scheduled"},
+        sort=[("scheduled_for", 1), ("created_at", 1)],
+    ).to_list(length=10000)
+
+    now = utc_now()
+    if not posts:
+        await runtime_col.update_one(
+            {"_id": AUTO_SCHEDULE_MIGRATION_ID},
+            {
+                "$set": {
+                    "layout_version": AUTO_SCHEDULE_LAYOUT_VERSION,
+                    "post_count": 0,
+                    "updated_at": now,
+                }
+            },
+            upsert=True,
+        )
+        return 0
+
+    assignments = build_schedule_assignments(len(posts), now)
+    for post, (scheduled_for, batch_label, batch_position) in zip(posts, assignments):
+        delay_seconds = max(0, int((scheduled_for - now).total_seconds()))
+        await scheduled_posts_col.update_one(
+            {"_id": post["_id"], "status": "scheduled"},
+            {
+                "$set": {
+                    "scheduled_for": scheduled_for,
+                    "delay_seconds": delay_seconds,
+                    "delay_label": f"Batch {batch_label} #{batch_position}",
+                    "schedule_layout_version": AUTO_SCHEDULE_LAYOUT_VERSION,
+                    "rescheduled_at": now,
+                    "rescheduled_from": post.get("scheduled_for"),
+                    "updated_at": now,
+                }
+            },
+        )
+
+    await runtime_col.update_one(
+        {"_id": AUTO_SCHEDULE_MIGRATION_ID},
+        {
+            "$set": {
+                "layout_version": AUTO_SCHEDULE_LAYOUT_VERSION,
+                "post_count": len(posts),
+                "updated_at": now,
+            }
+        },
+        upsert=True,
+    )
+    return len(posts)
 
 
 def get_post_link(post_data: dict) -> str:
@@ -563,6 +682,9 @@ async def create_auto_scheduled_post(pending: dict) -> tuple[datetime, str, int]
         "delay_seconds": delay_seconds,
         "delay_label": delay_label,
         "scheduled_for": scheduled_for,
+        "schedule_layout_version": AUTO_SCHEDULE_LAYOUT_VERSION,
+        "schedule_source": pending.get("schedule_source", "fresh_upload"),
+        "reused_from_token": pending.get("reused_from_token"),
         "created_at": now,
         "updated_at": now,
         "sent_at": None,
@@ -664,6 +786,7 @@ async def scheduled_post_poller(application) -> None:
     while True:
         try:
             await publish_due_scheduled_posts(application.bot)
+            await maintain_schedule_supply(application.bot)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -839,6 +962,185 @@ async def send_auto_schedule_confirmation(bot: Bot, pending: dict, scheduled_for
             "Failed to send auto-schedule confirmation for token %s",
             pending.get("token"),
         )
+
+
+async def maybe_send_low_queue_notice(bot: Bot, pending_count: int) -> None:
+    if pending_count > AUTO_REUSE_NOTIFY_THRESHOLD:
+        return
+
+    now = utc_now()
+    state = await runtime_col.find_one({"_id": AUTO_REUSE_NOTICE_STATE_ID}) or {}
+    last_sent_at = state.get("last_sent_at")
+    if isinstance(last_sent_at, datetime):
+        next_notice_at = last_sent_at + timedelta(seconds=AUTO_REUSE_NOTICE_COOLDOWN_SECONDS)
+        if next_notice_at > now:
+            return
+
+    try:
+        await bot.send_message(
+            chat_id=ADMIN_USER_ID,
+            text=(
+                "Schedule materials are getting low.\n\n"
+                f"Pending scheduled posts: <code>{pending_count}</code>\n"
+                "Upload new materials to the storage/intake flow when ready.\n"
+                "If no fresh materials arrive, I will reuse old stored materials automatically."
+            ),
+            parse_mode="HTML",
+        )
+        await runtime_col.update_one(
+            {"_id": AUTO_REUSE_NOTICE_STATE_ID},
+            {"$set": {"last_sent_at": now, "pending_count": pending_count}},
+            upsert=True,
+        )
+    except Exception:
+        logging.exception("Failed to send low schedule notice to admin.")
+
+
+async def get_reuse_source_posts() -> list[dict]:
+    return await scheduled_posts_col.find(
+        {
+            "status": "sent",
+            "token": {"$exists": True, "$ne": None},
+        },
+        sort=[("sent_at", 1), ("created_at", 1)],
+    ).to_list(length=AUTO_REUSE_SOURCE_SCAN_LIMIT)
+
+
+def rotate_reuse_sources(sources: list[dict], last_source_token: str | None) -> list[dict]:
+    if not sources or not last_source_token:
+        return sources
+
+    for index, source in enumerate(sources):
+        if source.get("token") == last_source_token:
+            return sources[index + 1:] + sources[:index + 1]
+    return sources
+
+
+async def build_reused_pending_from_source(source_post: dict) -> dict | None:
+    source_token = source_post.get("token")
+    if not source_token:
+        return None
+
+    source_file = await files_col.find_one({"token": source_token}) or {}
+    file_name = (
+        source_post.get("file_name")
+        or source_file.get("file_name")
+        or "Reused_Post"
+    )
+    video_duration = source_file.get("video_duration", 0) or 0
+    duration = source_post.get("duration") or format_duration(video_duration)
+
+    for _attempt in range(5):
+        token = generate_token()
+        link = f"{GATEWAY_URL}?token={token}"
+        try:
+            await files_col.insert_one({
+                "file_name": file_name,
+                "token": token,
+                "storage_msg_id": source_file.get("storage_msg_id"),
+                "video_duration": video_duration,
+                "created_at": utc_now(),
+                "total_downloads": 0,
+                "reused_from_token": source_token,
+                "reuse_source": "auto_low_schedule_refill",
+            })
+            return {
+                "token": token,
+                "name": file_name,
+                "duration": duration,
+                "link": link,
+                "caption": await pick_next_caption(),
+                "thumb": source_post.get("thumbnail_file_id") or source_post.get("thumb"),
+                "schedule_source": "auto_reuse",
+                "reused_from_token": source_token,
+            }
+        except DuplicateKeyError:
+            continue
+
+    raise RuntimeError("Could not generate a unique reuse token.")
+
+
+async def refill_schedule_from_old_material(bot: Bot, pending_count: int) -> int:
+    refill_count = max(0, AUTO_REUSE_TARGET_PENDING - pending_count)
+    if refill_count <= 0:
+        return 0
+
+    sources = await get_reuse_source_posts()
+    if not sources:
+        state = await runtime_col.find_one({"_id": AUTO_REUSE_STATE_ID}) or {}
+        last_no_source_at = state.get("last_no_source_at")
+        now = utc_now()
+        should_notify = not isinstance(last_no_source_at, datetime) or (
+            last_no_source_at + timedelta(seconds=AUTO_REUSE_NOTICE_COOLDOWN_SECONDS) <= now
+        )
+        if should_notify:
+            try:
+                await bot.send_message(
+                    chat_id=ADMIN_USER_ID,
+                    text=(
+                        "Schedule is low, but I could not find sent materials to reuse yet.\n"
+                        "Please upload new materials."
+                    ),
+                )
+                await runtime_col.update_one(
+                    {"_id": AUTO_REUSE_STATE_ID},
+                    {"$set": {"last_no_source_at": now}},
+                    upsert=True,
+                )
+            except Exception:
+                logging.exception("Failed to notify admin that no reuse materials exist.")
+        return 0
+
+    state = await runtime_col.find_one({"_id": AUTO_REUSE_STATE_ID}) or {}
+    sources = rotate_reuse_sources(sources, state.get("last_source_token"))
+
+    created_count = 0
+    last_source_token = None
+    for index in range(refill_count):
+        source_post = sources[index % len(sources)]
+        pending = await build_reused_pending_from_source(source_post)
+        if not pending:
+            continue
+
+        await create_auto_scheduled_post(pending)
+        created_count += 1
+        last_source_token = source_post.get("token") or last_source_token
+
+    if created_count:
+        await runtime_col.update_one(
+            {"_id": AUTO_REUSE_STATE_ID},
+            {
+                "$set": {
+                    "last_source_token": last_source_token,
+                    "last_refill_at": utc_now(),
+                    "last_refill_count": created_count,
+                }
+            },
+            upsert=True,
+        )
+        try:
+            await bot.send_message(
+                chat_id=ADMIN_USER_ID,
+                text=(
+                    "Old stored materials were reused to keep the schedule running.\n\n"
+                    f"New scheduled posts: <code>{created_count}</code>\n"
+                    f"Target pending posts: <code>{AUTO_REUSE_TARGET_PENDING}</code>\n"
+                    "Fresh uploads will still use the normal storage flow first."
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            logging.exception("Failed to send reuse refill summary to admin.")
+
+    return created_count
+
+
+async def maintain_schedule_supply(bot: Bot) -> None:
+    pending_count = await scheduled_posts_col.count_documents({"status": "scheduled"})
+    await maybe_send_low_queue_notice(bot, pending_count)
+
+    if pending_count <= AUTO_REUSE_REFILL_THRESHOLD:
+        await refill_schedule_from_old_material(bot, pending_count)
 
 
 def get_nude_detector():
@@ -1924,6 +2226,21 @@ async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_startup(application) -> None:
     await ensure_runtime_indexes()
+    rescheduled_count = await reschedule_existing_pending_posts_for_new_layout()
+    if rescheduled_count:
+        try:
+            await application.bot.send_message(
+                chat_id=ADMIN_USER_ID,
+                text=(
+                    "Existing scheduled posts were moved to the new auto schedule.\n\n"
+                    f"Rescheduled posts: <code>{rescheduled_count}</code>\n"
+                    "Pattern: <code>6 AM to 12 AM, every 2 hours</code>\n"
+                    f"Posts per slot: <code>{AUTO_BATCH_LIMIT}</code>"
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            logging.exception("Failed to notify admin about schedule migration.")
     application.bot_data["scheduled_post_task"] = asyncio.create_task(
         scheduled_post_poller(application)
     )
@@ -2092,6 +2409,21 @@ async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_startup(application) -> None:
     await ensure_runtime_indexes()
+    rescheduled_count = await reschedule_existing_pending_posts_for_new_layout()
+    if rescheduled_count:
+        try:
+            await application.bot.send_message(
+                chat_id=ADMIN_USER_ID,
+                text=(
+                    "Existing scheduled posts were moved to the new auto schedule.\n\n"
+                    f"Rescheduled posts: <code>{rescheduled_count}</code>\n"
+                    "Pattern: <code>6 AM to 12 AM, every 2 hours</code>\n"
+                    f"Posts per slot: <code>{AUTO_BATCH_LIMIT}</code>"
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            logging.exception("Failed to notify admin about schedule migration.")
     try:
         await application.bot.set_my_commands(
             [BotCommand("start", "Open the bot dashboard")],
