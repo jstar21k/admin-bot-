@@ -153,21 +153,30 @@ SCHEDULE_LABELS = {seconds: label for label, seconds in SCHEDULE_OPTIONS}
 SCHEDULE_LIST_LIMIT = 10
 AUTO_BATCH_SLOTS = (
     (0, 6, 0, "6:00 AM"),
+    (0, 7, 0, "7:00 AM"),
     (0, 8, 0, "8:00 AM"),
+    (0, 9, 0, "9:00 AM"),
     (0, 10, 0, "10:00 AM"),
+    (0, 11, 0, "11:00 AM"),
     (0, 12, 0, "12:00 PM"),
+    (0, 13, 0, "1:00 PM"),
     (0, 14, 0, "2:00 PM"),
+    (0, 15, 0, "3:00 PM"),
     (0, 16, 0, "4:00 PM"),
+    (0, 17, 0, "5:00 PM"),
     (0, 18, 0, "6:00 PM"),
+    (0, 19, 0, "7:00 PM"),
     (0, 20, 0, "8:00 PM"),
+    (0, 21, 0, "9:00 PM"),
     (0, 22, 0, "10:00 PM"),
+    (0, 23, 0, "11:00 PM"),
     (1, 0, 0, "12:00 AM"),
 )
 AUTO_BATCH_LIMIT = 5
 AUTO_BATCH_LOOKAHEAD_DAYS = 21
 CAPTION_ROTATION_STATE_ID = "caption_rotation_state"
-AUTO_SCHEDULE_LAYOUT_VERSION = "every_2h_6am_to_12am_v1"
-AUTO_SCHEDULE_MIGRATION_ID = "schedule_migration_every_2h_6am_to_12am_v1"
+AUTO_SCHEDULE_LAYOUT_VERSION = "hourly_6am_to_12am_v1"
+AUTO_SCHEDULE_MIGRATION_ID = "schedule_migration_hourly_6am_to_12am_v1"
 AUTO_REUSE_STATE_ID = "auto_reuse_material_state"
 AUTO_REUSE_NOTICE_STATE_ID = "auto_reuse_low_queue_notice"
 AUTO_REUSE_NOTIFY_THRESHOLD = _env_int("AUTO_REUSE_NOTIFY_THRESHOLD", 20, 1)
@@ -175,6 +184,8 @@ AUTO_REUSE_REFILL_THRESHOLD = _env_int("AUTO_REUSE_REFILL_THRESHOLD", 10, 0)
 AUTO_REUSE_TARGET_PENDING = _env_int("AUTO_REUSE_TARGET_PENDING", 100, AUTO_BATCH_LIMIT)
 AUTO_REUSE_SOURCE_SCAN_LIMIT = _env_int("AUTO_REUSE_SOURCE_SCAN_LIMIT", 500, 20)
 AUTO_REUSE_NOTICE_COOLDOWN_SECONDS = _env_int("AUTO_REUSE_NOTICE_COOLDOWN_SECONDS", 12 * 60 * 60, 60)
+CHANNEL_POST_DELETE_AFTER_SECONDS = _env_int("CHANNEL_POST_DELETE_AFTER_SECONDS", 3 * 60 * 60, 60)
+CHANNEL_DELETE_RETRY_SECONDS = _env_int("CHANNEL_DELETE_RETRY_SECONDS", 10 * 60, 60)
 
 LEGACY_CAPTIONS_35_OLD = [
     "End tak dekhoge toh hairan reh jaoge! 😲🔥",
@@ -717,18 +728,24 @@ async def claim_due_scheduled_post() -> dict | None:
 
 async def mark_scheduled_post_sent(post_id, sent_message_id: int | None, target_chat_id: int) -> None:
     now = utc_now()
+    update_fields = {
+        "status": "sent",
+        "sent_at": now,
+        "updated_at": now,
+        "target_message_id": sent_message_id,
+        "target_chat_id": target_chat_id,
+        "last_error": None,
+    }
+    if POST_CHANNEL_ID and target_chat_id == POST_CHANNEL_ID and sent_message_id:
+        update_fields.update({
+            "delete_after_seconds": CHANNEL_POST_DELETE_AFTER_SECONDS,
+            "delete_at": now + timedelta(seconds=CHANNEL_POST_DELETE_AFTER_SECONDS),
+            "delete_last_error": None,
+        })
+
     await scheduled_posts_col.update_one(
         {"_id": post_id},
-        {
-            "$set": {
-                "status": "sent",
-                "sent_at": now,
-                "updated_at": now,
-                "target_message_id": sent_message_id,
-                "target_chat_id": target_chat_id,
-                "last_error": None,
-            }
-        },
+        {"$set": update_fields},
     )
 
 
@@ -745,6 +762,66 @@ async def mark_scheduled_post_failed(post_id, error_message: str) -> None:
             }
         },
     )
+
+
+async def delete_expired_channel_posts(bot: Bot) -> None:
+    if not POST_CHANNEL_ID:
+        return
+
+    now = utc_now()
+    retry_before = now - timedelta(seconds=CHANNEL_DELETE_RETRY_SECONDS)
+    posts = await scheduled_posts_col.find(
+        {
+            "status": "sent",
+            "target_chat_id": POST_CHANNEL_ID,
+            "target_message_id": {"$exists": True, "$ne": None},
+            "delete_at": {"$lte": now},
+            "deleted_at": {"$exists": False},
+            "$or": [
+                {"delete_attempted_at": {"$exists": False}},
+                {"delete_attempted_at": {"$lte": retry_before}},
+            ],
+        },
+        sort=[("delete_at", 1)],
+    ).to_list(length=100)
+
+    for post in posts:
+        post_id = post["_id"]
+        try:
+            await bot.delete_message(
+                chat_id=POST_CHANNEL_ID,
+                message_id=int(post["target_message_id"]),
+            )
+            await scheduled_posts_col.update_one(
+                {"_id": post_id},
+                {
+                    "$set": {
+                        "deleted_at": utc_now(),
+                        "delete_attempted_at": utc_now(),
+                        "delete_last_error": None,
+                        "updated_at": utc_now(),
+                    }
+                },
+            )
+            logging.info(
+                "Deleted scheduled channel post for token %s",
+                post.get("token"),
+            )
+        except Exception as exc:
+            await scheduled_posts_col.update_one(
+                {"_id": post_id},
+                {
+                    "$set": {
+                        "delete_attempted_at": utc_now(),
+                        "delete_last_error": str(exc),
+                        "updated_at": utc_now(),
+                    }
+                },
+            )
+            logging.exception(
+                "Failed to delete scheduled channel post for token %s",
+                post.get("token"),
+            )
 
 
 async def publish_due_scheduled_posts(bot: Bot) -> None:
@@ -786,6 +863,7 @@ async def scheduled_post_poller(application) -> None:
     while True:
         try:
             await publish_due_scheduled_posts(application.bot)
+            await delete_expired_channel_posts(application.bot)
             await maintain_schedule_supply(application.bot)
         except asyncio.CancelledError:
             raise
@@ -2234,7 +2312,7 @@ async def on_startup(application) -> None:
                 text=(
                     "Existing scheduled posts were moved to the new auto schedule.\n\n"
                     f"Rescheduled posts: <code>{rescheduled_count}</code>\n"
-                    "Pattern: <code>6 AM to 12 AM, every 2 hours</code>\n"
+                    "Pattern: <code>6 AM to 12 AM, every 1 hour</code>\n"
                     f"Posts per slot: <code>{AUTO_BATCH_LIMIT}</code>"
                 ),
                 parse_mode="HTML",
@@ -2417,7 +2495,7 @@ async def on_startup(application) -> None:
                 text=(
                     "Existing scheduled posts were moved to the new auto schedule.\n\n"
                     f"Rescheduled posts: <code>{rescheduled_count}</code>\n"
-                    "Pattern: <code>6 AM to 12 AM, every 2 hours</code>\n"
+                    "Pattern: <code>6 AM to 12 AM, every 1 hour</code>\n"
                     f"Posts per slot: <code>{AUTO_BATCH_LIMIT}</code>"
                 ),
                 parse_mode="HTML",
