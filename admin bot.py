@@ -175,8 +175,8 @@ AUTO_BATCH_SLOTS = (
 AUTO_BATCH_LIMIT = 5
 AUTO_BATCH_LOOKAHEAD_DAYS = 21
 CAPTION_ROTATION_STATE_ID = "caption_rotation_state"
-AUTO_SCHEDULE_LAYOUT_VERSION = "hourly_6am_to_12am_v1"
-AUTO_SCHEDULE_MIGRATION_ID = "schedule_migration_hourly_6am_to_12am_v1"
+AUTO_SCHEDULE_LAYOUT_VERSION = "hourly_6am_to_12am_next_slot_v2"
+AUTO_SCHEDULE_MIGRATION_ID = "schedule_migration_hourly_6am_to_12am_next_slot_v2"
 AUTO_REUSE_STATE_ID = "auto_reuse_material_state"
 AUTO_REUSE_NOTICE_STATE_ID = "auto_reuse_low_queue_notice"
 AUTO_REUSE_NOTIFY_THRESHOLD = _env_int("AUTO_REUSE_NOTIFY_THRESHOLD", 20, 1)
@@ -512,7 +512,7 @@ def build_schedule_assignments(
     start_time: datetime | None = None,
 ) -> list[tuple[datetime, str, int]]:
     assignments = []
-    slots = iter_upcoming_batch_slots(start_time, from_next_6am=True)
+    slots = iter_upcoming_batch_slots(start_time)
 
     while len(assignments) < item_count:
         try:
