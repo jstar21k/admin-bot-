@@ -2615,6 +2615,14 @@ async def on_shutdown(application) -> None:
     client.close()
 
 
+async def handle_bot_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    error_text = str(context.error or "")
+    if "message is not modified" in error_text.lower():
+        logging.info("Ignored Telegram no-op edit: %s", error_text)
+        return
+    logging.exception("Unhandled bot error", exc_info=context.error)
+
+
 if __name__ == '__main__':
     app = (
         ApplicationBuilder()
@@ -2655,4 +2663,5 @@ if __name__ == '__main__':
     ))
 
     print("🚀 JSTAR PRO Bot is Live...")
+    app.add_error_handler(handle_bot_error)
     app.run_polling()
