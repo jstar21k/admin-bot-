@@ -1098,6 +1098,13 @@ async def auto_schedule_pending_post(
 
 
 async def send_auto_schedule_confirmation(bot: Bot, pending: dict, scheduled_for: datetime, delay_label: str) -> None:
+    logging.info(
+        "Post scheduled automatically for token %s at %s (%s).",
+        pending.get("token"),
+        format_schedule_time(scheduled_for),
+        delay_label,
+    )
+    return
     try:
         await bot.send_message(
             chat_id=ADMIN_USER_ID,
@@ -1114,6 +1121,10 @@ async def send_auto_schedule_confirmation(bot: Bot, pending: dict, scheduled_for
             "Failed to send auto-schedule confirmation for token %s",
             pending.get("token"),
         )
+
+
+async def suppress_admin_notice(*args, **kwargs) -> None:
+    return
 
 
 async def maybe_send_low_queue_notice(bot: Bot, pending_count: int) -> None:
@@ -1828,7 +1839,7 @@ async def on_storage_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cancel_pending_thumb_timeout(pending.get('token'))
 
             try:
-                await context.bot.send_message(
+                await suppress_admin_notice(
                     chat_id=ADMIN_USER_ID,
                     text="🖼 <b>Matching thumbnail found in the storage channel.</b>\nScheduling automatically now.",
                     parse_mode="HTML",
@@ -1920,7 +1931,7 @@ async def on_storage_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _storage_thumbnail_candidate = None
 
             try:
-                await context.bot.send_message(
+                await suppress_admin_notice(
                     chat_id=ADMIN_USER_ID,
                     text=(
                         f"🚀 <b>Auto-Link Created!</b>\n\n"
@@ -1956,7 +1967,7 @@ async def on_storage_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Send link to admin and wait for matching storage thumbnail ──
     schedule_pending_thumb_timeout(context.application, context.bot, pending)
     try:
-        await context.bot.send_message(
+        await suppress_admin_notice(
             chat_id=ADMIN_USER_ID,
             text=(
                 f"🚀 <b>Auto-Link Created!</b>\n\n"
@@ -2115,7 +2126,7 @@ async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML",
                 reply_markup=get_channel_kb(link),
             )
-            await q.message.reply_text(
+            await suppress_admin_notice(
                 "✅ <b>Done!</b> POST_CHANNEL_ID not set — sent to you.\nSet it in Railway to auto-post.",
                 parse_mode="HTML",
             )
@@ -2519,7 +2530,7 @@ async def post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pending,
                 pending_user_id=user_id,
             )
-            await q.message.reply_text(
+            await suppress_admin_notice(
                 "⏰ <b>Post scheduled automatically.</b>\n\n"
                 f"Batch: <code>{html.escape(delay_label)}</code>\n"
                 f"Time: <code>{format_schedule_time(scheduled_for)}</code>\n"
