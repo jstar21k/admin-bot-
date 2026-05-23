@@ -9,7 +9,7 @@ import socket
 import tempfile
 import uuid
 from contextlib import suppress
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
@@ -171,12 +171,13 @@ AUTO_BATCH_SLOTS = (
     (0, 22, 0, "10:00 PM"),
     (0, 23, 0, "11:00 PM"),
     (1, 0, 0, "12:00 AM"),
+    (1, 1, 0, "1:00 AM"),
 )
 AUTO_BATCH_LIMIT = 10
 AUTO_BATCH_LOOKAHEAD_DAYS = 21
 CAPTION_ROTATION_STATE_ID = "caption_rotation_state"
-AUTO_SCHEDULE_LAYOUT_VERSION = "hourly_6am_to_12am_10_per_slot_v3"
-AUTO_SCHEDULE_MIGRATION_ID = "schedule_migration_hourly_6am_to_12am_10_per_slot_v3"
+AUTO_SCHEDULE_LAYOUT_VERSION = "hourly_6am_to_1am_10_per_slot_v4"
+AUTO_SCHEDULE_MIGRATION_ID = "schedule_migration_hourly_6am_to_1am_10_per_slot_v4"
 AUTO_REUSE_STATE_ID = "auto_reuse_material_state"
 AUTO_REUSE_NOTICE_STATE_ID = "auto_reuse_low_queue_notice"
 AUTO_REUSE_NOTIFY_THRESHOLD = _env_int("AUTO_REUSE_NOTIFY_THRESHOLD", 20, 1)
@@ -471,7 +472,10 @@ def iter_upcoming_batch_slots(
     if from_next_6am:
         start_date = get_next_6am_start(current_time).astimezone(DISPLAY_TIMEZONE).date()
     else:
-        start_date = current_time.astimezone(DISPLAY_TIMEZONE).date()
+        current_local = current_time.astimezone(DISPLAY_TIMEZONE)
+        start_date = current_local.date()
+        if current_local.time() < time(6, 0):
+            start_date -= timedelta(days=1)
 
     for day_offset in range(AUTO_BATCH_LOOKAHEAD_DAYS):
         schedule_date = start_date + timedelta(days=day_offset)
@@ -1511,7 +1515,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data = await users_col.find_one({"user_id": user.id})
     if user_data and user_data.get("channel_joined"):
         await update.message.reply_text(
-            "👋 Welcome back!\n\nTo get /see videos - @link69_viral",
+            "👋 Welcome back!\n\nTo get videos - @link69_viral",
             parse_mode="HTML",
         )
         return
@@ -1520,7 +1524,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     joined = await is_joined(context.bot, user.id)
     if joined:
         await update.message.reply_text(
-            "👋 Welcome back!\n\nTo get /see videos - @link69_viral",
+            "👋 Welcome back!\n\nTo get videos - @link69_viral",
             parse_mode="HTML",
         )
     else:
@@ -1636,7 +1640,7 @@ async def force_join_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     await q.edit_message_text(
-        "✅ <b>Welcome!</b>\n\nTo get /see videos - @link69_viral",
+        "✅ <b>Welcome!</b>\n\nTo get videos - @link69_viral",
         parse_mode="HTML",
     )
 
