@@ -129,8 +129,9 @@ LEGACY_CAPTIONS_20 = [
 
 # ━━━ PENDING POST STATE (in-memory) ━━━━━━━━━━━━━━━━━━━━━━━━━
 # When media lands in storage, this dict holds the pending post info
-# until the matched storage thumbnail or later preview flow completes.
-_pending_post = {}  # user_id -> {token, name, duration, thumb, caption, preview_msg_id}
+# until the matched storage thumbnail arrives or the upload expires.
+_pending_post = {}  # user_id -> {token, name, duration, thumb, caption}
+_pending_thumb_timeout_tasks = {}  # token -> asyncio task for missing-thumbnail cleanup
 _storage_thumbnail_candidate = None  # last unmatched storage-channel image for the single-post flow
 
 
@@ -185,6 +186,7 @@ AUTO_REUSE_REFILL_THRESHOLD = _env_int("AUTO_REUSE_REFILL_THRESHOLD", 10, 0)
 AUTO_REUSE_TARGET_PENDING = _env_int("AUTO_REUSE_TARGET_PENDING", 100, AUTO_BATCH_LIMIT)
 AUTO_REUSE_SOURCE_SCAN_LIMIT = _env_int("AUTO_REUSE_SOURCE_SCAN_LIMIT", 500, 20)
 AUTO_REUSE_NOTICE_COOLDOWN_SECONDS = _env_int("AUTO_REUSE_NOTICE_COOLDOWN_SECONDS", 12 * 60 * 60, 60)
+THUMBNAIL_WAIT_SECONDS = _env_int("THUMBNAIL_WAIT_SECONDS", 2 * 60, 10)
 CHANNEL_POST_DELETE_AFTER_SECONDS = _env_int("CHANNEL_POST_DELETE_AFTER_SECONDS", 6 * 60 * 60, 60)
 CHANNEL_DELETE_RETRY_SECONDS = _env_int("CHANNEL_DELETE_RETRY_SECONDS", 10 * 60, 60)
 
@@ -599,6 +601,64 @@ def build_post_caption(post_data: dict) -> str:
     return f"{post_data['caption']}\n\n⏱️ Duration: {post_data['duration']}"
 
 
+def has_public_thumbnail(post_data: dict) -> bool:
+    return bool(
+        post_data.get("thumbnail_file_id")
+        or post_data.get("thumb")
+        or post_data.get("thumb_bytes")
+    )
+
+
+def cancel_pending_thumb_timeout(token: str | None) -> None:
+    if not token:
+        return
+    task = _pending_thumb_timeout_tasks.pop(token, None)
+    if task and not task.done():
+        task.cancel()
+
+
+async def remove_pending_upload_token(token: str | None) -> None:
+    if token:
+        await files_col.delete_one({"token": token})
+
+
+async def expire_pending_without_thumbnail(bot: Bot, token: str) -> None:
+    try:
+        await asyncio.sleep(THUMBNAIL_WAIT_SECONDS)
+        pending = _pending_post.get(ADMIN_USER_ID)
+        if not pending or pending.get("token") != token or has_public_thumbnail(pending):
+            return
+
+        _pending_post.pop(ADMIN_USER_ID, None)
+        await remove_pending_upload_token(token)
+        with suppress(Exception):
+            await bot.send_message(
+                chat_id=ADMIN_USER_ID,
+                text=(
+                    "No matching thumbnail arrived in 2 minutes.\n"
+                    "The pending upload was removed and will not be posted."
+                ),
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logging.exception("Failed to expire pending thumbnail wait for token %s", token)
+    finally:
+        current_task = asyncio.current_task()
+        if _pending_thumb_timeout_tasks.get(token) is current_task:
+            _pending_thumb_timeout_tasks.pop(token, None)
+
+
+def schedule_pending_thumb_timeout(application, bot: Bot, pending: dict) -> None:
+    token = pending.get("token")
+    if not token:
+        return
+    cancel_pending_thumb_timeout(token)
+    _pending_thumb_timeout_tasks[token] = application.create_task(
+        expire_pending_without_thumbnail(bot, token)
+    )
+
+
 def is_storage_thumbnail_post(post) -> bool:
     if post.photo:
         return True
@@ -632,9 +692,11 @@ def get_post_media(post_data: dict):
 
 async def send_public_post(bot: Bot, post_data: dict):
     link = get_post_link(post_data)
-    caption = build_post_caption(post_data)
     target_chat_id = POST_CHANNEL_ID or ADMIN_USER_ID
     media = get_post_media(post_data)
+    if not media:
+        raise ValueError("Thumbnail is required for scheduled channel posts.")
+    caption = None if target_chat_id == POST_CHANNEL_ID else build_post_caption(post_data)
 
     if media:
         sent_message = await bot.send_photo(
@@ -657,6 +719,9 @@ async def send_public_post(bot: Bot, post_data: dict):
 
 
 async def create_scheduled_post(pending: dict, delay_seconds: int) -> datetime:
+    if not has_public_thumbnail(pending):
+        raise ValueError("Thumbnail is required before scheduling.")
+
     now = utc_now()
     scheduled_for = now + timedelta(seconds=delay_seconds)
     await scheduled_posts_col.insert_one({
@@ -682,6 +747,9 @@ async def create_scheduled_post(pending: dict, delay_seconds: int) -> datetime:
 
 
 async def create_auto_scheduled_post(pending: dict) -> tuple[datetime, str, int]:
+    if not has_public_thumbnail(pending):
+        raise ValueError("Thumbnail is required before scheduling.")
+
     now = utc_now()
     scheduled_for, batch_label, batch_position = await get_next_auto_schedule_slot()
     delay_seconds = max(0, int((scheduled_for - now).total_seconds()))
@@ -1013,6 +1081,7 @@ async def auto_schedule_pending_post(
     pending: dict,
     pending_user_id: int | None = None,
 ) -> tuple[datetime, str]:
+    cancel_pending_thumb_timeout(pending.get("token"))
     scheduled_for, delay_label, _batch_position = await create_auto_scheduled_post(pending)
     if pending_user_id is not None:
         _pending_post.pop(pending_user_id, None)
@@ -1083,6 +1152,10 @@ async def get_reuse_source_posts() -> list[dict]:
         {
             "status": "sent",
             "token": {"$exists": True, "$ne": None},
+            "$or": [
+                {"thumbnail_file_id": {"$exists": True, "$ne": None}},
+                {"thumb": {"$exists": True, "$ne": None}},
+            ],
         },
         sort=[("sent_at", 1), ("created_at", 1)],
     ).to_list(length=AUTO_REUSE_SOURCE_SCAN_LIMIT)
@@ -1111,6 +1184,9 @@ async def build_reused_pending_from_source(source_post: dict) -> dict | None:
     )
     video_duration = source_file.get("video_duration", 0) or 0
     duration = source_post.get("duration") or format_duration(video_duration)
+    thumb = source_post.get("thumbnail_file_id") or source_post.get("thumb")
+    if not thumb:
+        return None
 
     for _attempt in range(5):
         token = generate_token()
@@ -1132,7 +1208,7 @@ async def build_reused_pending_from_source(source_post: dict) -> dict | None:
                 "duration": duration,
                 "link": link,
                 "caption": await pick_next_caption(),
-                "thumb": source_post.get("thumbnail_file_id") or source_post.get("thumb"),
+                "thumb": thumb,
                 "schedule_source": "auto_reuse",
                 "reused_from_token": source_token,
             }
@@ -1160,7 +1236,7 @@ async def refill_schedule_from_old_material(bot: Bot, pending_count: int) -> int
                 await bot.send_message(
                     chat_id=ADMIN_USER_ID,
                     text=(
-                        "Schedule is low, but I could not find sent materials to reuse yet.\n"
+                        "Schedule is low, but I could not find thumbnail-backed sent materials to reuse yet.\n"
                         "Please upload new materials."
                     ),
                 )
@@ -1748,14 +1824,14 @@ async def on_storage_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             pending['thumb'] = thumb_file_id
             _storage_thumbnail_candidate = None
+            cancel_pending_thumb_timeout(pending.get('token'))
 
             try:
                 await context.bot.send_message(
                     chat_id=ADMIN_USER_ID,
-                    text="🖼 <b>Matching thumbnail found in the storage channel.</b>\nPreview is ready below.",
+                    text="🖼 <b>Matching thumbnail found in the storage channel.</b>\nScheduling automatically now.",
                     parse_mode="HTML",
                 )
-                await send_pending_preview(context.bot, pending)
                 scheduled_for, delay_label = await auto_schedule_pending_post(
                     context.bot,
                     pending,
@@ -1765,14 +1841,14 @@ async def on_storage_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _pending_post.pop(ADMIN_USER_ID, None)
             except Exception:
                 logging.exception(
-                    "Failed to build preview after matching storage thumbnail for token %s",
+                    "Failed to schedule after matching storage thumbnail for token %s",
                     pending.get('token'),
                 )
             return
 
         if pending:
             logging.warning(
-                "Ignoring storage thumbnail message %s because token %s is already in preview/schedule flow.",
+                "Ignoring storage thumbnail message %s because token %s is already in schedule flow.",
                 post.message_id,
                 pending.get('token'),
             )
@@ -1831,6 +1907,10 @@ async def on_storage_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'storage_msg_id': post.message_id,
         'awaiting_storage_thumb': True,
     }
+    old_pending = _pending_post.get(ADMIN_USER_ID)
+    if old_pending and not has_public_thumbnail(old_pending):
+        cancel_pending_thumb_timeout(old_pending.get('token'))
+        await remove_pending_upload_token(old_pending.get('token'))
     _pending_post[ADMIN_USER_ID] = pending
 
     if _storage_thumbnail_candidate:
@@ -1850,7 +1930,6 @@ async def on_storage_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     ),
                     parse_mode="HTML",
                 )
-                await send_pending_preview(context.bot, pending)
                 scheduled_for, delay_label = await auto_schedule_pending_post(
                     context.bot,
                     pending,
@@ -1874,6 +1953,7 @@ async def on_storage_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _storage_thumbnail_candidate = None
 
     # ── Send link to admin and wait for matching storage thumbnail ──
+    schedule_pending_thumb_timeout(context.application, context.bot, pending)
     try:
         await context.bot.send_message(
             chat_id=ADMIN_USER_ID,
@@ -1883,13 +1963,14 @@ async def on_storage_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⏱️ <code>{format_duration(video_duration)}</code>\n"
                 f"🔗 <code>{link}</code>\n\n"
                 f"🖼 <b>Waiting for the matching thumbnail image from the storage channel.</b>\n"
-                f"The post will stay pending until it arrives there.\n"
-                f"(or send /skip to post without thumbnail)"
+                f"The post will be removed if no thumbnail arrives in 2 minutes."
             ),
             parse_mode="HTML",
         )
     except Exception:
         logging.error("Failed to notify admin.")
+        cancel_pending_thumb_timeout(token)
+        await remove_pending_upload_token(token)
         _pending_post.pop(ADMIN_USER_ID, None)
 
 
@@ -1910,25 +1991,12 @@ async def on_admin_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.photo:
         return  # Not a photo
 
-    # ── Save thumbnail, generate caption, show preview ──
-    photo_file = await context.bot.get_file(update.message.photo[-1].file_id)
-    pending['thumb_bytes'] = censor_thumbnail_bytes(
-        bytes(await photo_file.download_as_bytearray())
-    )
+    cancel_pending_thumb_timeout(pending.get('token'))
+    pending['thumb'] = update.message.photo[-1].file_id
+
+    # ── Save thumbnail and schedule automatically ──
     pending['caption'] = await pick_next_caption()
 
-    link = f"{GATEWAY_URL}?token={pending['token']}"
-    cap = f"{pending['caption']}\n\n⏱ Duration: {pending['duration']}"
-
-    preview_msg = await update.message.reply_photo(
-        photo=build_thumb_inputfile(pending['thumb_bytes']),
-        caption=cap,
-        parse_mode="HTML",
-    )
-    if preview_msg.photo:
-        pending['thumb'] = preview_msg.photo[-1].file_id
-    pending['preview_msg_id'] = preview_msg.message_id
-    pending['preview_chat_id'] = preview_msg.chat_id
     try:
         scheduled_for, delay_label = await auto_schedule_pending_post(
             context.bot,
@@ -2316,7 +2384,7 @@ async def on_startup(application) -> None:
                 text=(
                     "Existing scheduled posts were moved to the new auto schedule.\n\n"
                     f"Rescheduled posts: <code>{rescheduled_count}</code>\n"
-                    "Pattern: <code>6 AM to 12 AM, every 1 hour</code>\n"
+                    "Pattern: <code>6 AM to 1 AM, every 1 hour</code>\n"
                     f"Posts per slot: <code>{AUTO_BATCH_LIMIT}</code>"
                 ),
                 parse_mode="HTML",
@@ -2391,10 +2459,18 @@ async def skip_thumb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id != ADMIN_USER_ID:
         return
 
-    pending = _pending_post.get(user_id)
+    pending = _pending_post.pop(user_id, None)
     if not pending:
         await update.message.reply_text("❌ No pending post to skip.")
         return
+
+    cancel_pending_thumb_timeout(pending.get('token'))
+    await remove_pending_upload_token(pending.get('token'))
+    await update.message.reply_text(
+        "Pending upload removed because thumbnail is required. It will not be posted.",
+        parse_mode="HTML",
+    )
+    return
 
     pending['caption'] = await pick_next_caption()
 
@@ -2499,7 +2575,7 @@ async def on_startup(application) -> None:
                 text=(
                     "Existing scheduled posts were moved to the new auto schedule.\n\n"
                     f"Rescheduled posts: <code>{rescheduled_count}</code>\n"
-                    "Pattern: <code>6 AM to 12 AM, every 1 hour</code>\n"
+                    "Pattern: <code>6 AM to 1 AM, every 1 hour</code>\n"
                     f"Posts per slot: <code>{AUTO_BATCH_LIMIT}</code>"
                 ),
                 parse_mode="HTML",
