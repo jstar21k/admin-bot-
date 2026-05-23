@@ -153,6 +153,7 @@ SCHEDULE_OPTIONS = (
 SCHEDULE_LABELS = {seconds: label for label, seconds in SCHEDULE_OPTIONS}
 SCHEDULE_LIST_LIMIT = 10
 AUTO_BATCH_SLOTS = (
+    (0, 5, 20, "5:20 AM"),
     (0, 6, 0, "6:00 AM"),
     (0, 7, 0, "7:00 AM"),
     (0, 8, 0, "8:00 AM"),
@@ -177,8 +178,8 @@ AUTO_BATCH_SLOTS = (
 AUTO_BATCH_LIMIT = 10
 AUTO_BATCH_LOOKAHEAD_DAYS = 21
 CAPTION_ROTATION_STATE_ID = "caption_rotation_state"
-AUTO_SCHEDULE_LAYOUT_VERSION = "hourly_6am_to_1am_10_per_slot_v4"
-AUTO_SCHEDULE_MIGRATION_ID = "schedule_migration_hourly_6am_to_1am_10_per_slot_v4"
+AUTO_SCHEDULE_LAYOUT_VERSION = "daily_520am_then_hourly_6am_to_1am_10_per_slot_v5"
+AUTO_SCHEDULE_MIGRATION_ID = "schedule_migration_daily_520am_then_hourly_6am_to_1am_10_per_slot_v5"
 AUTO_REUSE_STATE_ID = "auto_reuse_material_state"
 AUTO_REUSE_NOTICE_STATE_ID = "auto_reuse_low_queue_notice"
 AUTO_REUSE_NOTIFY_THRESHOLD = _env_int("AUTO_REUSE_NOTIFY_THRESHOLD", 20, 1)
@@ -459,7 +460,7 @@ def format_schedule_time(value: datetime | None) -> str:
 def get_next_6am_start(start_time: datetime | None = None) -> datetime:
     current_time = start_time or utc_now()
     current_local = current_time.astimezone(DISPLAY_TIMEZONE)
-    start_local = current_local.replace(hour=6, minute=0, second=0, microsecond=0)
+    start_local = current_local.replace(hour=5, minute=20, second=0, microsecond=0)
     if current_local >= start_local:
         start_local += timedelta(days=1)
     return start_local.astimezone(timezone.utc)
@@ -476,7 +477,7 @@ def iter_upcoming_batch_slots(
     else:
         current_local = current_time.astimezone(DISPLAY_TIMEZONE)
         start_date = current_local.date()
-        if current_local.time() < time(6, 0):
+        if current_local.time() < time(5, 20):
             start_date -= timedelta(days=1)
 
     for day_offset in range(AUTO_BATCH_LOOKAHEAD_DAYS):
@@ -2384,7 +2385,7 @@ async def on_startup(application) -> None:
                 text=(
                     "Existing scheduled posts were moved to the new auto schedule.\n\n"
                     f"Rescheduled posts: <code>{rescheduled_count}</code>\n"
-                    "Pattern: <code>6 AM to 1 AM, every 1 hour</code>\n"
+                    "Pattern: <code>5:20 AM, then hourly 6 AM to 1 AM</code>\n"
                     f"Posts per slot: <code>{AUTO_BATCH_LIMIT}</code>"
                 ),
                 parse_mode="HTML",
@@ -2575,7 +2576,7 @@ async def on_startup(application) -> None:
                 text=(
                     "Existing scheduled posts were moved to the new auto schedule.\n\n"
                     f"Rescheduled posts: <code>{rescheduled_count}</code>\n"
-                    "Pattern: <code>6 AM to 1 AM, every 1 hour</code>\n"
+                    "Pattern: <code>5:20 AM, then hourly 6 AM to 1 AM</code>\n"
                     f"Posts per slot: <code>{AUTO_BATCH_LIMIT}</code>"
                 ),
                 parse_mode="HTML",
