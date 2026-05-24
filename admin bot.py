@@ -423,6 +423,12 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def ensure_aware_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 async def pick_next_caption(exclude: str | None = None) -> str:
     available = list(CAPTIONS)
     if exclude and len(available) > 1:
@@ -1135,6 +1141,7 @@ async def maybe_send_low_queue_notice(bot: Bot, pending_count: int) -> None:
     state = await runtime_col.find_one({"_id": AUTO_REUSE_NOTICE_STATE_ID}) or {}
     last_sent_at = state.get("last_sent_at")
     if isinstance(last_sent_at, datetime):
+        last_sent_at = ensure_aware_utc(last_sent_at)
         next_notice_at = last_sent_at + timedelta(seconds=AUTO_REUSE_NOTICE_COOLDOWN_SECONDS)
         if next_notice_at > now:
             return
