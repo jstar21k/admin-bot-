@@ -17,7 +17,7 @@ from telegram import (
     Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup,
     BotCommand, BotCommandScopeDefault, InputFile
 )
-from telegram.error import Conflict
+from telegram.error import BadRequest, Conflict
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
@@ -883,6 +883,24 @@ async def delete_expired_channel_posts(bot: Bot) -> None:
                 post.get("token"),
             )
         except Exception as exc:
+            if isinstance(exc, BadRequest) and "message to delete not found" in str(exc).lower():
+                await scheduled_posts_col.update_one(
+                    {"_id": post_id},
+                    {
+                        "$set": {
+                            "deleted_at": utc_now(),
+                            "delete_attempted_at": utc_now(),
+                            "delete_last_error": None,
+                            "updated_at": utc_now(),
+                        }
+                    },
+                )
+                logging.info(
+                    "Scheduled channel post for token %s was already missing; marked as deleted.",
+                    post.get("token"),
+                )
+                continue
+
             await scheduled_posts_col.update_one(
                 {"_id": post_id},
                 {
