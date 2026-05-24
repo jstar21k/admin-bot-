@@ -180,12 +180,8 @@ AUTO_BATCH_LOOKAHEAD_DAYS = 21
 CAPTION_ROTATION_STATE_ID = "caption_rotation_state"
 AUTO_SCHEDULE_LAYOUT_VERSION = "daily_520am_then_hourly_6am_to_1am_10_per_slot_v5"
 AUTO_SCHEDULE_MIGRATION_ID = "schedule_migration_daily_520am_then_hourly_6am_to_1am_10_per_slot_v5"
-AUTO_REUSE_STATE_ID = "auto_reuse_material_state"
 AUTO_REUSE_NOTICE_STATE_ID = "auto_reuse_low_queue_notice"
 AUTO_REUSE_NOTIFY_THRESHOLD = _env_int("AUTO_REUSE_NOTIFY_THRESHOLD", 20, 1)
-AUTO_REUSE_REFILL_THRESHOLD = _env_int("AUTO_REUSE_REFILL_THRESHOLD", 10, 0)
-AUTO_REUSE_TARGET_PENDING = _env_int("AUTO_REUSE_TARGET_PENDING", 100, AUTO_BATCH_LIMIT)
-AUTO_REUSE_SOURCE_SCAN_LIMIT = _env_int("AUTO_REUSE_SOURCE_SCAN_LIMIT", 500, 20)
 AUTO_REUSE_NOTICE_COOLDOWN_SECONDS = _env_int("AUTO_REUSE_NOTICE_COOLDOWN_SECONDS", 12 * 60 * 60, 60)
 THUMBNAIL_WAIT_SECONDS = _env_int("THUMBNAIL_WAIT_SECONDS", 2 * 60, 10)
 CHANNEL_POST_DELETE_AFTER_SECONDS = _env_int("CHANNEL_POST_DELETE_AFTER_SECONDS", 6 * 60 * 60, 60)
@@ -1152,8 +1148,7 @@ async def maybe_send_low_queue_notice(bot: Bot, pending_count: int) -> None:
             text=(
                 "Schedule materials are getting low.\n\n"
                 f"Pending scheduled posts: <code>{pending_count}</code>\n"
-                "Upload new materials to the storage/intake flow when ready.\n"
-                "If no fresh materials arrive, I will reuse old stored materials automatically."
+                "Upload new materials to the storage/intake flow when ready."
             ),
             parse_mode="HTML",
         )
@@ -1166,158 +1161,9 @@ async def maybe_send_low_queue_notice(bot: Bot, pending_count: int) -> None:
         logging.exception("Failed to send low schedule notice to admin.")
 
 
-async def get_reuse_source_posts() -> list[dict]:
-    return await scheduled_posts_col.find(
-        {
-            "status": "sent",
-            "token": {"$exists": True, "$ne": None},
-            "$or": [
-                {"thumbnail_file_id": {"$exists": True, "$ne": None}},
-                {"thumb": {"$exists": True, "$ne": None}},
-            ],
-        },
-        sort=[("sent_at", 1), ("created_at", 1)],
-    ).to_list(length=AUTO_REUSE_SOURCE_SCAN_LIMIT)
-
-
-def rotate_reuse_sources(sources: list[dict], last_source_token: str | None) -> list[dict]:
-    if not sources or not last_source_token:
-        return sources
-
-    for index, source in enumerate(sources):
-        if source.get("token") == last_source_token:
-            return sources[index + 1:] + sources[:index + 1]
-    return sources
-
-
-async def build_reused_pending_from_source(source_post: dict) -> dict | None:
-    source_token = source_post.get("token")
-    if not source_token:
-        return None
-
-    source_file = await files_col.find_one({"token": source_token}) or {}
-    file_name = (
-        source_post.get("file_name")
-        or source_file.get("file_name")
-        or "Reused_Post"
-    )
-    video_duration = source_file.get("video_duration", 0) or 0
-    duration = source_post.get("duration") or format_duration(video_duration)
-    thumb = source_post.get("thumbnail_file_id") or source_post.get("thumb")
-    if not thumb:
-        return None
-
-    for _attempt in range(5):
-        token = generate_token()
-        link = f"{GATEWAY_URL}?token={token}"
-        try:
-            await files_col.insert_one({
-                "file_name": file_name,
-                "token": token,
-                "storage_msg_id": source_file.get("storage_msg_id"),
-                "video_duration": video_duration,
-                "created_at": utc_now(),
-                "total_downloads": 0,
-                "reused_from_token": source_token,
-                "reuse_source": "auto_low_schedule_refill",
-            })
-            return {
-                "token": token,
-                "name": file_name,
-                "duration": duration,
-                "link": link,
-                "caption": await pick_next_caption(),
-                "thumb": thumb,
-                "schedule_source": "auto_reuse",
-                "reused_from_token": source_token,
-            }
-        except DuplicateKeyError:
-            continue
-
-    raise RuntimeError("Could not generate a unique reuse token.")
-
-
-async def refill_schedule_from_old_material(bot: Bot, pending_count: int) -> int:
-    refill_count = max(0, AUTO_REUSE_TARGET_PENDING - pending_count)
-    if refill_count <= 0:
-        return 0
-
-    sources = await get_reuse_source_posts()
-    if not sources:
-        state = await runtime_col.find_one({"_id": AUTO_REUSE_STATE_ID}) or {}
-        last_no_source_at = state.get("last_no_source_at")
-        now = utc_now()
-        should_notify = not isinstance(last_no_source_at, datetime) or (
-            last_no_source_at + timedelta(seconds=AUTO_REUSE_NOTICE_COOLDOWN_SECONDS) <= now
-        )
-        if should_notify:
-            try:
-                await bot.send_message(
-                    chat_id=ADMIN_USER_ID,
-                    text=(
-                        "Schedule is low, but I could not find thumbnail-backed sent materials to reuse yet.\n"
-                        "Please upload new materials."
-                    ),
-                )
-                await runtime_col.update_one(
-                    {"_id": AUTO_REUSE_STATE_ID},
-                    {"$set": {"last_no_source_at": now}},
-                    upsert=True,
-                )
-            except Exception:
-                logging.exception("Failed to notify admin that no reuse materials exist.")
-        return 0
-
-    state = await runtime_col.find_one({"_id": AUTO_REUSE_STATE_ID}) or {}
-    sources = rotate_reuse_sources(sources, state.get("last_source_token"))
-
-    created_count = 0
-    last_source_token = None
-    for index in range(refill_count):
-        source_post = sources[index % len(sources)]
-        pending = await build_reused_pending_from_source(source_post)
-        if not pending:
-            continue
-
-        await create_auto_scheduled_post(pending)
-        created_count += 1
-        last_source_token = source_post.get("token") or last_source_token
-
-    if created_count:
-        await runtime_col.update_one(
-            {"_id": AUTO_REUSE_STATE_ID},
-            {
-                "$set": {
-                    "last_source_token": last_source_token,
-                    "last_refill_at": utc_now(),
-                    "last_refill_count": created_count,
-                }
-            },
-            upsert=True,
-        )
-        try:
-            await bot.send_message(
-                chat_id=ADMIN_USER_ID,
-                text=(
-                    "Old stored materials were reused to keep the schedule running.\n\n"
-                    f"New scheduled posts: <code>{created_count}</code>\n"
-                    f"Target pending posts: <code>{AUTO_REUSE_TARGET_PENDING}</code>\n"
-                    "Fresh uploads will still use the normal storage flow first."
-                ),
-                parse_mode="HTML",
-            )
-        except Exception:
-            logging.exception("Failed to send reuse refill summary to admin.")
-
-    return created_count
-
-
 async def maintain_schedule_supply(bot: Bot) -> None:
     pending_count = await scheduled_posts_col.count_documents({"status": "scheduled"})
     await maybe_send_low_queue_notice(bot, pending_count)
-
-    if pending_count <= AUTO_REUSE_REFILL_THRESHOLD:
-        await refill_schedule_from_old_material(bot, pending_count)
 
 
 def get_nude_detector():
