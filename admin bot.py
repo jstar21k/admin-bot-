@@ -153,33 +153,21 @@ SCHEDULE_OPTIONS = (
 SCHEDULE_LABELS = {seconds: label for label, seconds in SCHEDULE_OPTIONS}
 SCHEDULE_LIST_LIMIT = 10
 AUTO_BATCH_SLOTS = (
-    (0, 5, 20, "5:20 AM"),
     (0, 6, 0, "6:00 AM"),
-    (0, 7, 0, "7:00 AM"),
-    (0, 8, 0, "8:00 AM"),
-    (0, 9, 0, "9:00 AM"),
-    (0, 10, 0, "10:00 AM"),
     (0, 11, 0, "11:00 AM"),
-    (0, 12, 0, "12:00 PM"),
-    (0, 13, 0, "1:00 PM"),
-    (0, 14, 0, "2:00 PM"),
     (0, 15, 0, "3:00 PM"),
-    (0, 16, 0, "4:00 PM"),
-    (0, 17, 0, "5:00 PM"),
-    (0, 18, 0, "6:00 PM"),
     (0, 19, 0, "7:00 PM"),
-    (0, 20, 0, "8:00 PM"),
-    (0, 21, 0, "9:00 PM"),
-    (0, 22, 0, "10:00 PM"),
-    (0, 23, 0, "11:00 PM"),
-    (1, 0, 0, "12:00 AM"),
-    (1, 1, 0, "1:00 AM"),
 )
 AUTO_BATCH_LIMIT = 10
 AUTO_BATCH_LOOKAHEAD_DAYS = 21
 CAPTION_ROTATION_STATE_ID = "caption_rotation_state"
-AUTO_SCHEDULE_LAYOUT_VERSION = "daily_520am_then_hourly_6am_to_1am_10_per_slot_v5"
-AUTO_SCHEDULE_MIGRATION_ID = "schedule_migration_daily_520am_then_hourly_6am_to_1am_10_per_slot_v5"
+AUTO_SCHEDULE_LAYOUT_VERSION = "daily_6am_11am_3pm_7pm_10_per_slot_v6"
+AUTO_SCHEDULE_MIGRATION_ID = "schedule_migration_daily_6am_11am_3pm_7pm_10_per_slot_v6"
+FILEBOT69_USERNAME = "Filebot69_bot"
+FILEBOT69_PROMO_TEXT = (
+    "Want more videos without waiting?\n\n"
+    f"Open @{FILEBOT69_USERNAME} and browse anytime."
+)
 AUTO_REUSE_NOTICE_STATE_ID = "auto_reuse_low_queue_notice"
 AUTO_REUSE_NOTIFY_THRESHOLD = _env_int("AUTO_REUSE_NOTIFY_THRESHOLD", 20, 1)
 AUTO_REUSE_NOTICE_COOLDOWN_SECONDS = _env_int("AUTO_REUSE_NOTICE_COOLDOWN_SECONDS", 12 * 60 * 60, 60)
@@ -462,7 +450,7 @@ def format_schedule_time(value: datetime | None) -> str:
 def get_next_6am_start(start_time: datetime | None = None) -> datetime:
     current_time = start_time or utc_now()
     current_local = current_time.astimezone(DISPLAY_TIMEZONE)
-    start_local = current_local.replace(hour=5, minute=20, second=0, microsecond=0)
+    start_local = current_local.replace(hour=6, minute=0, second=0, microsecond=0)
     if current_local >= start_local:
         start_local += timedelta(days=1)
     return start_local.astimezone(timezone.utc)
@@ -479,7 +467,7 @@ def iter_upcoming_batch_slots(
     else:
         current_local = current_time.astimezone(DISPLAY_TIMEZONE)
         start_date = current_local.date()
-        if current_local.time() < time(5, 20):
+        if current_local.time() < time(6, 0):
             start_date -= timedelta(days=1)
 
     for day_offset in range(AUTO_BATCH_LOOKAHEAD_DAYS):
@@ -824,6 +812,52 @@ async def mark_scheduled_post_sent(post_id, sent_message_id: int | None, target_
     )
 
 
+async def maybe_send_batch_promo(bot: Bot, scheduled_post: dict, target_chat_id: int) -> None:
+    if not POST_CHANNEL_ID or target_chat_id != POST_CHANNEL_ID:
+        return
+
+    scheduled_for = scheduled_post.get("scheduled_for")
+    if not isinstance(scheduled_for, datetime):
+        return
+
+    remaining = await scheduled_posts_col.count_documents(
+        {
+            "scheduled_for": scheduled_for,
+            "status": {"$in": ["scheduled", "posting"]},
+        }
+    )
+    if remaining:
+        return
+
+    scheduled_for_key = ensure_aware_utc(scheduled_for).isoformat()
+    promo_state_id = f"batch_promo_sent:{scheduled_for_key}"
+    result = await runtime_col.update_one(
+        {"_id": promo_state_id},
+        {
+            "$setOnInsert": {
+                "scheduled_for": ensure_aware_utc(scheduled_for),
+                "created_at": utc_now(),
+            }
+        },
+        upsert=True,
+    )
+    if not result.upserted_id:
+        return
+
+    try:
+        await bot.send_message(chat_id=POST_CHANNEL_ID, text=FILEBOT69_PROMO_TEXT)
+        await runtime_col.update_one(
+            {"_id": promo_state_id},
+            {"$set": {"sent_at": utc_now(), "status": "sent"}},
+        )
+    except Exception:
+        await runtime_col.update_one(
+            {"_id": promo_state_id},
+            {"$set": {"failed_at": utc_now(), "status": "failed"}},
+        )
+        logging.exception("Failed to send Filebot69 batch promo for %s", scheduled_for_key)
+
+
 async def mark_scheduled_post_failed(post_id, error_message: str) -> None:
     now = utc_now()
     await scheduled_posts_col.update_one(
@@ -930,6 +964,7 @@ async def publish_due_scheduled_posts(bot: Bot) -> None:
                 getattr(sent_message, "message_id", None),
                 target_chat_id,
             )
+            await maybe_send_batch_promo(bot, scheduled_post, target_chat_id)
             logging.info(
                 "Scheduled post sent for token %s at %s",
                 scheduled_post.get("token"),
@@ -1474,7 +1509,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data = await users_col.find_one({"user_id": user.id})
     if user_data and user_data.get("channel_joined"):
         await update.message.reply_text(
-            "👋 Welcome back!\n\nTo get videos - @link69_viral",
+            f"Welcome back.\n\nFor more videos, use @{FILEBOT69_USERNAME}",
             parse_mode="HTML",
         )
         return
@@ -1483,7 +1518,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     joined = await is_joined(context.bot, user.id)
     if joined:
         await update.message.reply_text(
-            "👋 Welcome back!\n\nTo get videos - @link69_viral",
+            f"Welcome back.\n\nFor more videos, use @{FILEBOT69_USERNAME}",
             parse_mode="HTML",
         )
     else:
@@ -1599,7 +1634,7 @@ async def force_join_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     await q.edit_message_text(
-        "✅ <b>Welcome!</b>\n\nTo get videos - @link69_viral",
+        f"<b>Welcome!</b>\n\nFor more videos, use @{FILEBOT69_USERNAME}",
         parse_mode="HTML",
     )
 
@@ -2267,7 +2302,7 @@ async def on_startup(application) -> None:
                 text=(
                     "Existing scheduled posts were moved to the new auto schedule.\n\n"
                     f"Rescheduled posts: <code>{rescheduled_count}</code>\n"
-                    "Pattern: <code>5:20 AM, then hourly 6 AM to 1 AM</code>\n"
+                    "Pattern: <code>6 AM, 11 AM, 3 PM, 7 PM</code>\n"
                     f"Posts per slot: <code>{AUTO_BATCH_LIMIT}</code>"
                 ),
                 parse_mode="HTML",
@@ -2458,7 +2493,7 @@ async def on_startup(application) -> None:
                 text=(
                     "Existing scheduled posts were moved to the new auto schedule.\n\n"
                     f"Rescheduled posts: <code>{rescheduled_count}</code>\n"
-                    "Pattern: <code>5:20 AM, then hourly 6 AM to 1 AM</code>\n"
+                    "Pattern: <code>6 AM, 11 AM, 3 PM, 7 PM</code>\n"
                     f"Posts per slot: <code>{AUTO_BATCH_LIMIT}</code>"
                 ),
                 parse_mode="HTML",
