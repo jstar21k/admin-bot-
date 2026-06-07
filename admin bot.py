@@ -154,20 +154,30 @@ SCHEDULE_LABELS = {seconds: label for label, seconds in SCHEDULE_OPTIONS}
 SCHEDULE_LIST_LIMIT = 10
 AUTO_BATCH_SLOTS = (
     (0, 6, 0, "6:00 AM"),
-    (0, 11, 0, "11:00 AM"),
-    (0, 15, 0, "3:00 PM"),
-    (0, 19, 0, "7:00 PM"),
+    (0, 8, 0, "8:00 AM"),
+    (0, 10, 0, "10:00 AM"),
+    (0, 12, 0, "12:00 PM"),
+    (0, 14, 0, "2:00 PM"),
+    (0, 16, 0, "4:00 PM"),
+    (0, 18, 0, "6:00 PM"),
+    (0, 20, 0, "8:00 PM"),
+    (0, 22, 0, "10:00 PM"),
+    (1, 0, 0, "12:00 AM"),
 )
 AUTO_BATCH_LIMIT = 10
 AUTO_BATCH_LOOKAHEAD_DAYS = 21
 CAPTION_ROTATION_STATE_ID = "caption_rotation_state"
-AUTO_SCHEDULE_LAYOUT_VERSION = "daily_6am_11am_3pm_7pm_10_per_slot_v6"
-AUTO_SCHEDULE_MIGRATION_ID = "schedule_migration_daily_6am_11am_3pm_7pm_10_per_slot_v6"
+AUTO_SCHEDULE_LAYOUT_VERSION = "daily_every_2h_6am_to_12am_10_per_slot_v8"
+AUTO_SCHEDULE_MIGRATION_ID = "schedule_migration_daily_every_2h_6am_to_12am_10_per_slot_v8"
 FILEBOT69_USERNAME = "Filebot69_bot"
 FILEBOT69_PROMO_TEXT = (
     "Want more videos without waiting?\n\n"
     f"Open @{FILEBOT69_USERNAME} and browse anytime."
 )
+AUTO_REUSE_CURSOR_STATE_ID = "auto_reuse_cursor_v2"
+AUTO_REUSE_SLOT_TOPUP_PREFIX = "auto_reuse_slot_topup_v2"
+AUTO_REUSE_SOURCE_SCAN_LIMIT = _env_int("AUTO_REUSE_SOURCE_SCAN_LIMIT", 10000, AUTO_BATCH_LIMIT)
+AUTO_REUSE_SLOT_GRACE_SECONDS = _env_int("AUTO_REUSE_SLOT_GRACE_SECONDS", 10 * 60, SCHEDULE_POLL_SECONDS)
 AUTO_REUSE_NOTICE_STATE_ID = "auto_reuse_low_queue_notice"
 AUTO_REUSE_NOTIFY_THRESHOLD = _env_int("AUTO_REUSE_NOTIFY_THRESHOLD", 20, 1)
 AUTO_REUSE_NOTICE_COOLDOWN_SECONDS = _env_int("AUTO_REUSE_NOTICE_COOLDOWN_SECONDS", 12 * 60 * 60, 60)
@@ -496,12 +506,268 @@ async def count_batch_slot_posts(scheduled_for: datetime) -> int:
     )
 
 
+async def count_batch_slot_total_posts(scheduled_for: datetime) -> int:
+    return await scheduled_posts_col.count_documents(
+        {
+            "status": {"$in": ["scheduled", "posting", "sent", "failed"]},
+            "scheduled_for": scheduled_for,
+        }
+    )
+
+
 async def get_next_auto_schedule_slot() -> tuple[datetime, str, int]:
     for scheduled_for, batch_label in iter_upcoming_batch_slots():
         booked_count = await count_batch_slot_posts(scheduled_for)
         if booked_count < AUTO_BATCH_LIMIT:
             return scheduled_for, batch_label, booked_count + 1
     raise RuntimeError("No free auto-schedule batch slot found in the next 21 days.")
+
+
+def iter_due_reuse_batch_slots(current_time: datetime | None = None):
+    current_time = current_time or utc_now()
+    current_local = current_time.astimezone(DISPLAY_TIMEZONE)
+    start_date = current_local.date() - timedelta(days=1)
+
+    for day_offset in range(3):
+        schedule_date = start_date + timedelta(days=day_offset)
+        for slot_day_offset, hour, minute, label in AUTO_BATCH_SLOTS:
+            slot_date = schedule_date + timedelta(days=slot_day_offset)
+            slot_local = datetime(
+                slot_date.year,
+                slot_date.month,
+                slot_date.day,
+                hour,
+                minute,
+                tzinfo=DISPLAY_TIMEZONE,
+            )
+            slot_utc = slot_local.astimezone(timezone.utc)
+            delta_seconds = (current_time - slot_utc).total_seconds()
+            if 0 <= delta_seconds <= AUTO_REUSE_SLOT_GRACE_SECONDS:
+                yield slot_utc, label
+
+
+def is_valid_reuse_link(link: str | None) -> bool:
+    if not isinstance(link, str):
+        return False
+    cleaned = link.strip()
+    gateway_base = GATEWAY_URL.rstrip("/")
+    return (
+        cleaned.startswith(("http://", "https://"))
+        and "token=" in cleaned
+        and ("vidplays.in" in cleaned or (gateway_base and cleaned.startswith(gateway_base)))
+    )
+
+
+def get_reuse_thumbnail(source_post: dict) -> str | None:
+    thumb = source_post.get("thumbnail_file_id") or source_post.get("thumb")
+    if isinstance(thumb, str) and thumb.strip():
+        return thumb
+    return None
+
+
+async def get_reuse_source_posts() -> list[dict]:
+    source_filter = {
+        "status": "sent",
+        "sent_at": {"$exists": True, "$ne": None},
+        "target_message_id": {"$exists": True, "$ne": None},
+        "schedule_source": {"$ne": "auto_reuse"},
+        "link": {"$exists": True, "$ne": None},
+        "$or": [
+            {"thumbnail_file_id": {"$exists": True, "$nin": [None, ""]}},
+            {"thumb": {"$exists": True, "$nin": [None, ""]}},
+        ],
+    }
+    if POST_CHANNEL_ID:
+        source_filter["target_chat_id"] = POST_CHANNEL_ID
+
+    candidates = await scheduled_posts_col.find(
+        source_filter,
+        sort=[("target_message_id", 1), ("sent_at", 1), ("created_at", 1), ("_id", 1)],
+    ).to_list(length=AUTO_REUSE_SOURCE_SCAN_LIMIT)
+    return [
+        post for post in candidates
+        if get_reuse_thumbnail(post) and is_valid_reuse_link(post.get("link"))
+    ]
+
+
+def select_reuse_sources(
+    sources: list[dict],
+    last_source_token: str | None,
+    needed_count: int,
+) -> list[dict]:
+    if not sources or needed_count <= 0:
+        return []
+
+    start_index = 0
+    if last_source_token:
+        for index, source in enumerate(sources):
+            if source.get("token") == last_source_token:
+                start_index = (index + 1) % len(sources)
+                break
+
+    selected_count = min(needed_count, len(sources))
+    return [
+        sources[(start_index + offset) % len(sources)]
+        for offset in range(selected_count)
+    ]
+
+
+async def create_reuse_scheduled_post(
+    source_post: dict,
+    scheduled_for: datetime,
+    batch_label: str,
+    batch_position: int,
+) -> bool:
+    thumb = get_reuse_thumbnail(source_post)
+    link = source_post.get("link")
+    source_token = source_post.get("token")
+    if not thumb or not is_valid_reuse_link(link) or not source_token:
+        return False
+
+    now = utc_now()
+    delay_seconds = max(0, int((scheduled_for - now).total_seconds()))
+    for _attempt in range(5):
+        synthetic_token = f"reuse_{secrets.token_urlsafe(10)[:10]}"
+        try:
+            await scheduled_posts_col.insert_one({
+                "token": synthetic_token,
+                "file_name": source_post.get("file_name") or "Reused_Post",
+                "caption": source_post.get("caption") or "",
+                "duration": source_post.get("duration") or "",
+                "thumbnail_file_id": thumb,
+                "link": link,
+                "status": "scheduled",
+                "delay_seconds": delay_seconds,
+                "delay_label": f"Batch {batch_label} #{batch_position}",
+                "scheduled_for": scheduled_for,
+                "schedule_layout_version": AUTO_SCHEDULE_LAYOUT_VERSION,
+                "schedule_source": "auto_reuse",
+                "reused_from_token": source_token,
+                "reuse_source_post_id": source_post.get("_id"),
+                "created_at": now,
+                "updated_at": now,
+                "sent_at": None,
+                "failed_at": None,
+                "last_error": None,
+                "target_chat_id": POST_CHANNEL_ID or ADMIN_USER_ID,
+                "target_message_id": None,
+            })
+            return True
+        except DuplicateKeyError:
+            continue
+
+    raise RuntimeError("Could not generate a unique reuse schedule token.")
+
+
+async def top_up_batch_slot_from_old_posts(
+    bot: Bot,
+    scheduled_for: datetime,
+    batch_label: str,
+) -> int:
+    if not POST_CHANNEL_ID:
+        return 0
+
+    slot_count = await count_batch_slot_total_posts(scheduled_for)
+    missing_count = max(0, AUTO_BATCH_LIMIT - slot_count)
+    if missing_count <= 0:
+        return 0
+
+    scheduled_for_key = ensure_aware_utc(scheduled_for).isoformat()
+    topup_state_id = f"{AUTO_REUSE_SLOT_TOPUP_PREFIX}:{scheduled_for_key}"
+    lock_result = await runtime_col.update_one(
+        {"_id": topup_state_id},
+        {
+            "$setOnInsert": {
+                "scheduled_for": ensure_aware_utc(scheduled_for),
+                "status": "started",
+                "started_at": utc_now(),
+                "slot_count_before": slot_count,
+                "missing_count": missing_count,
+            }
+        },
+        upsert=True,
+    )
+    if not lock_result.upserted_id:
+        return 0
+
+    sources = await get_reuse_source_posts()
+    if not sources:
+        await runtime_col.update_one(
+            {"_id": topup_state_id},
+            {"$set": {"status": "no_sources", "finished_at": utc_now()}},
+        )
+        return 0
+
+    cursor = await runtime_col.find_one({"_id": AUTO_REUSE_CURSOR_STATE_ID}) or {}
+    selected_sources = select_reuse_sources(
+        sources,
+        cursor.get("last_source_token"),
+        missing_count,
+    )
+
+    created_count = 0
+    last_created_source_token = cursor.get("last_source_token")
+    for source in selected_sources:
+        batch_position = slot_count + created_count + 1
+        try:
+            created = await create_reuse_scheduled_post(
+                source,
+                scheduled_for,
+                batch_label,
+                batch_position,
+            )
+        except Exception:
+            logging.exception("Failed to create auto-reuse scheduled post.")
+            continue
+
+        if created:
+            created_count += 1
+            last_created_source_token = source.get("token") or last_created_source_token
+
+    if created_count:
+        await runtime_col.update_one(
+            {"_id": AUTO_REUSE_CURSOR_STATE_ID},
+            {
+                "$set": {
+                    "last_source_token": last_created_source_token,
+                    "updated_at": utc_now(),
+                    "source_count": len(sources),
+                }
+            },
+            upsert=True,
+        )
+
+    await runtime_col.update_one(
+        {"_id": topup_state_id},
+        {
+            "$set": {
+                "status": "completed",
+                "finished_at": utc_now(),
+                "created_count": created_count,
+                "source_count": len(sources),
+                "last_source_token": last_created_source_token,
+            }
+        },
+    )
+
+    if created_count:
+        logging.info(
+            "Auto-reused %s old posts for %s.",
+            created_count,
+            format_schedule_time(scheduled_for),
+        )
+    return created_count
+
+
+async def top_up_due_batch_slots_from_old_posts(bot: Bot) -> int:
+    created_count = 0
+    for scheduled_for, batch_label in iter_due_reuse_batch_slots():
+        created_count += await top_up_batch_slot_from_old_posts(
+            bot,
+            scheduled_for,
+            batch_label,
+        )
+    return created_count
 
 
 def build_schedule_assignments(
@@ -532,6 +798,10 @@ async def reschedule_existing_pending_posts_for_new_layout() -> int:
     if state and state.get("layout_version") == AUTO_SCHEDULE_LAYOUT_VERSION:
         return 0
 
+    removed_reuse = await scheduled_posts_col.delete_many(
+        {"status": "scheduled", "schedule_source": "auto_reuse"}
+    )
+
     posts = await scheduled_posts_col.find(
         {"status": "scheduled"},
         sort=[("scheduled_for", 1), ("created_at", 1)],
@@ -545,6 +815,7 @@ async def reschedule_existing_pending_posts_for_new_layout() -> int:
                 "$set": {
                     "layout_version": AUTO_SCHEDULE_LAYOUT_VERSION,
                     "post_count": 0,
+                    "removed_pending_auto_reuse": removed_reuse.deleted_count,
                     "updated_at": now,
                 }
             },
@@ -576,6 +847,7 @@ async def reschedule_existing_pending_posts_for_new_layout() -> int:
             "$set": {
                 "layout_version": AUTO_SCHEDULE_LAYOUT_VERSION,
                 "post_count": len(posts),
+                "removed_pending_auto_reuse": removed_reuse.deleted_count,
                 "updated_at": now,
             }
         },
@@ -952,6 +1224,8 @@ async def delete_expired_channel_posts(bot: Bot) -> None:
 
 
 async def publish_due_scheduled_posts(bot: Bot) -> None:
+    await top_up_due_batch_slots_from_old_posts(bot)
+
     while True:
         scheduled_post = await claim_due_scheduled_post()
         if not scheduled_post:
@@ -2302,7 +2576,7 @@ async def on_startup(application) -> None:
                 text=(
                     "Existing scheduled posts were moved to the new auto schedule.\n\n"
                     f"Rescheduled posts: <code>{rescheduled_count}</code>\n"
-                    "Pattern: <code>6 AM, 11 AM, 3 PM, 7 PM</code>\n"
+                    "Pattern: <code>Every 2 hours from 6 AM to 12 AM</code>\n"
                     f"Posts per slot: <code>{AUTO_BATCH_LIMIT}</code>"
                 ),
                 parse_mode="HTML",
@@ -2493,7 +2767,7 @@ async def on_startup(application) -> None:
                 text=(
                     "Existing scheduled posts were moved to the new auto schedule.\n\n"
                     f"Rescheduled posts: <code>{rescheduled_count}</code>\n"
-                    "Pattern: <code>6 AM, 11 AM, 3 PM, 7 PM</code>\n"
+                    "Pattern: <code>Every 2 hours from 6 AM to 12 AM</code>\n"
                     f"Posts per slot: <code>{AUTO_BATCH_LIMIT}</code>"
                 ),
                 parse_mode="HTML",
