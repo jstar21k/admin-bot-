@@ -154,21 +154,30 @@ SCHEDULE_LABELS = {seconds: label for label, seconds in SCHEDULE_OPTIONS}
 SCHEDULE_LIST_LIMIT = 10
 AUTO_BATCH_SLOTS = (
     (0, 6, 0, "6:00 AM"),
+    (0, 7, 0, "7:00 AM"),
     (0, 8, 0, "8:00 AM"),
+    (0, 9, 0, "9:00 AM"),
     (0, 10, 0, "10:00 AM"),
+    (0, 11, 0, "11:00 AM"),
     (0, 12, 0, "12:00 PM"),
+    (0, 13, 0, "1:00 PM"),
     (0, 14, 0, "2:00 PM"),
+    (0, 15, 0, "3:00 PM"),
     (0, 16, 0, "4:00 PM"),
+    (0, 17, 0, "5:00 PM"),
     (0, 18, 0, "6:00 PM"),
+    (0, 19, 0, "7:00 PM"),
     (0, 20, 0, "8:00 PM"),
+    (0, 21, 0, "9:00 PM"),
     (0, 22, 0, "10:00 PM"),
+    (0, 23, 0, "11:00 PM"),
     (1, 0, 0, "12:00 AM"),
 )
 AUTO_BATCH_LIMIT = 10
 AUTO_BATCH_LOOKAHEAD_DAYS = 21
 CAPTION_ROTATION_STATE_ID = "caption_rotation_state"
-AUTO_SCHEDULE_LAYOUT_VERSION = "daily_every_2h_6am_to_12am_10_per_slot_v8"
-AUTO_SCHEDULE_MIGRATION_ID = "schedule_migration_daily_every_2h_6am_to_12am_10_per_slot_v8"
+AUTO_SCHEDULE_LAYOUT_VERSION = "daily_hourly_6am_to_12am_10_per_slot_v9"
+AUTO_SCHEDULE_MIGRATION_ID = "schedule_migration_daily_hourly_6am_to_12am_10_per_slot_v9"
 FILEBOT69_USERNAME = "Filebot69_bot"
 FILEBOT69_PROMO_TEXT = (
     "Want more videos without waiting?\n\n"
@@ -182,7 +191,7 @@ AUTO_REUSE_NOTICE_STATE_ID = "auto_reuse_low_queue_notice"
 AUTO_REUSE_NOTIFY_THRESHOLD = _env_int("AUTO_REUSE_NOTIFY_THRESHOLD", 20, 1)
 AUTO_REUSE_NOTICE_COOLDOWN_SECONDS = _env_int("AUTO_REUSE_NOTICE_COOLDOWN_SECONDS", 12 * 60 * 60, 60)
 THUMBNAIL_WAIT_SECONDS = _env_int("THUMBNAIL_WAIT_SECONDS", 2 * 60, 10)
-CHANNEL_POST_DELETE_AFTER_SECONDS = _env_int("CHANNEL_POST_DELETE_AFTER_SECONDS", 6 * 60 * 60, 60)
+CHANNEL_POST_DELETE_AFTER_SECONDS = _env_int("CHANNEL_POST_DELETE_AFTER_SECONDS", 12 * 60 * 60, 60)
 CHANNEL_DELETE_RETRY_SECONDS = _env_int("CHANNEL_DELETE_RETRY_SECONDS", 10 * 60, 60)
 
 LEGACY_CAPTIONS_35_OLD = [
@@ -1117,10 +1126,21 @@ async def maybe_send_batch_promo(bot: Bot, scheduled_post: dict, target_chat_id:
         return
 
     try:
-        await bot.send_message(chat_id=POST_CHANNEL_ID, text=FILEBOT69_PROMO_TEXT)
+        sent_message = await bot.send_message(chat_id=POST_CHANNEL_ID, text=FILEBOT69_PROMO_TEXT)
+        now = utc_now()
         await runtime_col.update_one(
             {"_id": promo_state_id},
-            {"$set": {"sent_at": utc_now(), "status": "sent"}},
+            {
+                "$set": {
+                    "sent_at": now,
+                    "status": "sent",
+                    "target_chat_id": POST_CHANNEL_ID,
+                    "target_message_id": getattr(sent_message, "message_id", None),
+                    "delete_after_seconds": CHANNEL_POST_DELETE_AFTER_SECONDS,
+                    "delete_at": now + timedelta(seconds=CHANNEL_POST_DELETE_AFTER_SECONDS),
+                    "delete_last_error": None,
+                }
+            },
         )
     except Exception:
         await runtime_col.update_one(
@@ -1223,6 +1243,84 @@ async def delete_expired_channel_posts(bot: Bot) -> None:
             )
 
 
+async def delete_expired_batch_promos(bot: Bot) -> None:
+    if not POST_CHANNEL_ID:
+        return
+
+    now = utc_now()
+    retry_before = now - timedelta(seconds=CHANNEL_DELETE_RETRY_SECONDS)
+    promos = await runtime_col.find(
+        {
+            "_id": {"$regex": "^batch_promo_sent:"},
+            "status": "sent",
+            "target_chat_id": POST_CHANNEL_ID,
+            "target_message_id": {"$exists": True, "$ne": None},
+            "delete_at": {"$lte": now},
+            "deleted_at": {"$exists": False},
+            "$or": [
+                {"delete_attempted_at": {"$exists": False}},
+                {"delete_attempted_at": {"$lte": retry_before}},
+            ],
+        },
+        sort=[("delete_at", 1)],
+    ).to_list(length=100)
+
+    for promo in promos:
+        promo_id = promo["_id"]
+        try:
+            await bot.delete_message(
+                chat_id=POST_CHANNEL_ID,
+                message_id=int(promo["target_message_id"]),
+            )
+            await runtime_col.update_one(
+                {"_id": promo_id},
+                {
+                    "$set": {
+                        "status": "deleted",
+                        "deleted_at": utc_now(),
+                        "delete_attempted_at": utc_now(),
+                        "delete_last_error": None,
+                        "updated_at": utc_now(),
+                    }
+                },
+            )
+            logging.info("Deleted Filebot69 batch promo for %s", promo.get("scheduled_for"))
+        except Exception as exc:
+            if isinstance(exc, BadRequest) and "message to delete not found" in str(exc).lower():
+                await runtime_col.update_one(
+                    {"_id": promo_id},
+                    {
+                        "$set": {
+                            "status": "deleted",
+                            "deleted_at": utc_now(),
+                            "delete_attempted_at": utc_now(),
+                            "delete_last_error": None,
+                            "updated_at": utc_now(),
+                        }
+                    },
+                )
+                logging.info(
+                    "Filebot69 batch promo for %s was already missing; marked as deleted.",
+                    promo.get("scheduled_for"),
+                )
+                continue
+
+            await runtime_col.update_one(
+                {"_id": promo_id},
+                {
+                    "$set": {
+                        "delete_attempted_at": utc_now(),
+                        "delete_last_error": str(exc),
+                        "updated_at": utc_now(),
+                    }
+                },
+            )
+            logging.exception(
+                "Failed to delete Filebot69 batch promo for %s",
+                promo.get("scheduled_for"),
+            )
+
+
 async def publish_due_scheduled_posts(bot: Bot) -> None:
     await top_up_due_batch_slots_from_old_posts(bot)
 
@@ -1266,6 +1364,7 @@ async def scheduled_post_poller(application) -> None:
         try:
             await publish_due_scheduled_posts(application.bot)
             await delete_expired_channel_posts(application.bot)
+            await delete_expired_batch_promos(application.bot)
             await maintain_schedule_supply(application.bot)
         except asyncio.CancelledError:
             raise
@@ -2576,7 +2675,7 @@ async def on_startup(application) -> None:
                 text=(
                     "Existing scheduled posts were moved to the new auto schedule.\n\n"
                     f"Rescheduled posts: <code>{rescheduled_count}</code>\n"
-                    "Pattern: <code>Every 2 hours from 6 AM to 12 AM</code>\n"
+                    "Pattern: <code>Every hour from 6 AM to 12 AM</code>\n"
                     f"Posts per slot: <code>{AUTO_BATCH_LIMIT}</code>"
                 ),
                 parse_mode="HTML",
@@ -2767,7 +2866,7 @@ async def on_startup(application) -> None:
                 text=(
                     "Existing scheduled posts were moved to the new auto schedule.\n\n"
                     f"Rescheduled posts: <code>{rescheduled_count}</code>\n"
-                    "Pattern: <code>Every 2 hours from 6 AM to 12 AM</code>\n"
+                    "Pattern: <code>Every hour from 6 AM to 12 AM</code>\n"
                     f"Posts per slot: <code>{AUTO_BATCH_LIMIT}</code>"
                 ),
                 parse_mode="HTML",
